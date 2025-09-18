@@ -71,15 +71,15 @@ def best_active_fuzzy_ratio(meta: Dict[str, Any], q_norm: str) -> Tuple[float, s
     return best, best_tok
 
 # ---- استخراج تركيزات وتحويلها mg ----
-_P_NUM = r"(?P<num>\d+(?:[.,]\d+)?)"
 UNIT_MG = r"(?:mg|MG|ملغ|مجم|ملجم|ميلي ?جرام|ميلي ?غرام)"
 UNIT_G  = r"(?:g|G|جم|جرام|غ|غرام)"
 UNIT_ML = r"(?:ml|mL|ML|مل|مليلتر)"
 
-RX_MG        = re.compile(rf"{_P_NUM}\s*{UNIT_MG}")
-RX_G         = re.compile(rf"{_P_NUM}\s*{UNIT_G}")
-RX_MG_PER_ML = re.compile(rf"{_P_NUM}\s*{UNIT_MG}\s*/\s*{_P_NUM}\s*{UNIT_ML}")
-RX_G_PER_ML  = re.compile(rf"{_P_NUM}\s*{UNIT_G}\s*/\s*{_P_NUM}\s*{UNIT_ML}")
+# ملاحظة: استخدمنا num / num1 / num2 لتجنّب تكرار نفس اسم الجروب داخل نفس الـ pattern
+RX_MG        = re.compile(rf"(?P<num>\d+(?:[.,]\d+)?)\s*{UNIT_MG}")
+RX_G         = re.compile(rf"(?P<num>\d+(?:[.,]\d+)?)\s*{UNIT_G}")
+RX_MG_PER_ML = re.compile(rf"(?P<num1>\d+(?:[.,]\d+)?)\s*{UNIT_MG}\s*/\s*(?P<num2>\d+(?:[.,]\d+)?)\s*{UNIT_ML}")
+RX_G_PER_ML  = re.compile(rf"(?P<num1>\d+(?:[.,]\d+)?)\s*{UNIT_G}\s*/\s*(?P<num2>\d+(?:[.,]\d+)?)\s*{UNIT_ML}")
 
 STRENGTH_KEYS = [
     "التراكيز", "التركيز", "strength", "dose_strength", "تركيز", "dosage_strength",
@@ -102,11 +102,11 @@ def _extract_strengths_from_text(text: str) -> List[Dict[str, Any]]:
         out.append({"mg": _to_float(m.group("num")) * 1000.0, "kind": "g", "raw": m.group(0)})
 
     for m in RX_MG_PER_ML.finditer(t):
-        mg = _to_float(m.group("num"))
+        mg = _to_float(m.group("num1"))
         out.append({"mg": mg, "ml": True, "kind": "mg_per_ml", "raw": m.group(0)})
 
     for m in RX_G_PER_ML.finditer(t):
-        mg = _to_float(m.group("num")) * 1000.0
+        mg = _to_float(m.group("num1")) * 1000.0
         out.append({"mg": mg, "ml": True, "kind": "g_per_ml", "raw": m.group(0)})
 
     return out
@@ -134,7 +134,6 @@ def strength_matches(items: List[Dict[str, Any]], target_mg: float, allow_per_ml
     return False, None
 
 # ---- تطبيع/كشف الشكل الدوائي (عربي/إنجليزي) → كود قياسي ----
-# نطوّع أشكال شائعة إلى أكواد قياسية
 FORM_PATTERNS = [
     ("tablet",   [r"اقراص?", r"\btab(?:let|\.|s)?\b", r"caplet", r"chew(?:able)?", r"film[- ]?coated", r"effervescent"]),
     ("capsule",  [r"كبسول(?:ه)?", r"\bcap(?:s|\.|ule|ules)?\b", r"soft\s*gel", r"سوفت ?جيل"]),
@@ -152,7 +151,6 @@ FORM_PATTERNS = [
     ("mouthwash",[r"(غرغره|غرغرة|غسول\s*الفم)", r"\bmouth\s*wash\b", r"\bgargle\b"]),
     ("sachet",   [r"(اكياس|أكياس|ساشيه|مسحوق)", r"\bsachet\b", r"\bpowder\b"]),
     ("shampoo",  [r"شامبو", r"\bshampoo\b"]),
-    # زود أشكال تانية لو عندك (patch, foam, balm, stick, ...)
 ]
 
 FORM_KEYS = ["الشكل الدوائي", "الشكل_الدوائي", "dosage_form", "form", "pharmaceutical_form",
