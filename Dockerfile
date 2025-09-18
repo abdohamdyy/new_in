@@ -15,6 +15,7 @@ WORKDIR /app
 COPY config.py .
 COPY drug_search.py .
 COPY app.py .
+COPY equivalents_search.py .
 
 RUN pip install --no-cache-dir \
     flask gunicorn \

@@ -3,22 +3,40 @@ from __future__ import annotations
 import os
 import json
 from flask import Flask, request, jsonify
+
 from drug_search import DrugSearch, DEFAULT_TOP_K, DEFAULT_MIN_SCORE10
+from equivalents_search import EquivalentsFinder  # <— جديد
 
 app = Flask(__name__)
 
-# إعدادات قابلة للتعديل من env (اختياري)
+# ================= إعدادات بحث الاسم التجاري =================
 SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", DEFAULT_TOP_K))
 SEARCH_MIN_SCORE10 = float(os.getenv("SEARCH_MIN_SCORE10", DEFAULT_MIN_SCORE10))
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", 50))
 
-# مهيّئ واحد للـ DrugSearch (أفضل للأداء)
 searcher = DrugSearch(top_k=SEARCH_TOP_K, min_score10=SEARCH_MIN_SCORE10)
+
+# ================= إعدادات بحث المثائل =================
+EQ_TOP_K = int(os.getenv("EQ_TOP_K", 800))
+EQ_MIN_BASE10 = float(os.getenv("EQ_MIN_BASE10", 0.0))
+EQ_LIMIT = int(os.getenv("EQ_LIMIT", 50))
+
+eq_finder = EquivalentsFinder(top_k=EQ_TOP_K, min_base10=EQ_MIN_BASE10)
+
+# ================= أدوات مساعدة =================
+def parse_bool(val, default: bool) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    return s in ("1", "true", "t", "yes", "y", "on", "اه", "ايوه")
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
+# ================= بحث الاسم التجاري (قائم) =================
 @app.get("/search")
 def search_get():
     """
@@ -71,7 +89,116 @@ def search_post():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==================== Endpoints المثائل (جديدة) ====================
+@app.get("/equivalents")
+def equivalents_get():
+    """
+    GET /equivalents?active=باراسيتامول&mg=500&form=أقراص&tol=0&allow_per_ml=true&strict_form=true&limit=50&topk=800&minbase=0
+    - active: إجباري (المادة الفعّالة/الاسم العلمي)
+    - mg: إجباري (تركيز بالمليجرام)
+    - form: اختياري (أقراص/كبسول/شراب/أمبول/...)
+    """
+    active = request.args.get("active", type=str)
+    mg = request.args.get("mg", type=str)  # ناخدها كنص ثم نعمل float بإيدينا علشان رسائل الخطأ
+    if not active or not active.strip():
+        return jsonify({"error": "missing 'active' parameter"}), 400
+    try:
+        mg_val = float(str(mg).strip())
+    except Exception:
+        return jsonify({"error": "invalid 'mg' parameter, must be a number (mg)"}), 400
+
+    form = request.args.get("form", type=str)
+    tol = request.args.get("tol", type=float) or 0.0
+    allow_per_ml = parse_bool(request.args.get("allow_per_ml"), True)
+    strict_form = parse_bool(request.args.get("strict_form"), True)
+    limit = request.args.get("limit", type=int) or EQ_LIMIT
+    topk = request.args.get("topk", type=int) or EQ_TOP_K
+    minbase = request.args.get("minbase", type=float) or EQ_MIN_BASE10
+
+    try:
+        # نستخدم instance مختلف لو غيّر المستخدم topk/minbase في الطلب الحالي
+        local_finder = eq_finder
+        if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
+            local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
+
+        results = local_finder.find_equivalents(
+            active_query=active.strip(),
+            target_mg=mg_val,
+            tolerance_mg=tol,
+            allow_per_ml=allow_per_ml,
+            target_form=form,
+            strict_form=strict_form,
+            limit=limit,
+        )
+        return app.response_class(
+            response=json.dumps(results, ensure_ascii=False),
+            status=200,
+            mimetype="application/json; charset=utf-8",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/equivalents")
+def equivalents_post():
+    """
+    POST /equivalents
+    Body JSON مثال:
+      {
+        "active": "باراسيتامول",
+        "mg": 500,
+        "form": "أقراص",
+        "tol": 0,
+        "allow_per_ml": true,
+        "strict_form": true,
+        "limit": 50,
+        "topk": 800,
+        "minbase": 0.0
+      }
+    """
+    if not request.is_json:
+        return jsonify({"error": "expected application/json body"}), 400
+    payload = request.get_json(silent=True) or {}
+
+    active = (payload.get("active") or "").strip()
+    if not active:
+        return jsonify({"error": "missing 'active' in JSON body"}), 400
+
+    try:
+        mg_val = float(payload.get("mg"))
+    except Exception:
+        return jsonify({"error": "invalid 'mg' in JSON body, must be a number (mg)"}), 400
+
+    form = payload.get("form")
+    tol = float(payload.get("tol") or 0.0)
+    allow_per_ml = parse_bool(payload.get("allow_per_ml"), True)
+    strict_form = parse_bool(payload.get("strict_form"), True)
+    limit = int(payload.get("limit") or EQ_LIMIT)
+    topk = int(payload.get("topk") or EQ_TOP_K)
+    minbase = float(payload.get("minbase") or EQ_MIN_BASE10)
+
+    try:
+        local_finder = eq_finder
+        if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
+            local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
+
+        results = local_finder.find_equivalents(
+            active_query=active,
+            target_mg=mg_val,
+            tolerance_mg=tol,
+            allow_per_ml=allow_per_ml,
+            target_form=form,
+            strict_form=strict_form,
+            limit=limit,
+        )
+        return app.response_class(
+            response=json.dumps(results, ensure_ascii=False),
+            status=200,
+            mimetype="application/json; charset=utf-8",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
-    # شغّل السيرفر المحلي
-    # لو داخل Docker/Gunicorn سيب بلوك التشغيل لمدير التشغيل
+    # شغّل السيرفر المحلي (جوّه Docker بنستخدم gunicorn)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5543")), debug=False)
