@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  duaya-api:
+    build: .
+    image: duaya-api:latest
+    container_name: duaya_api
+    restart: unless-stopped
+    environment:
+      SEARCH_TOP_K: "400"
+      SEARCH_MIN_SCORE10: "5.0"
+      SEARCH_LIMIT: "50"
+      HF_HOME: "/root/.cache/huggingface"
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONIOENCODING: "utf-8"
+    ports:
+      - "5543:5543"
+    volumes:
+      - ./chroma_db:/app/chroma_db:rw
+      - ./hf_cache:/root/.cache/huggingface:rw
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5543/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
