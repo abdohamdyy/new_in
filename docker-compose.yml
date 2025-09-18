@@ -1,22 +1,30 @@
-version: "3.9"
-
 services:
   duaya-api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: duaya-api:latest
     container_name: duaya_api
     restart: unless-stopped
     environment:
+      # إعدادات البحث بالاسم التجاري
       SEARCH_TOP_K: "400"
       SEARCH_MIN_SCORE10: "5.0"
       SEARCH_LIMIT: "50"
+      # إعدادات المثائل (equivalents)
+      EQ_TOP_K: "800"
+      EQ_MIN_BASE10: "0.0"
+      EQ_LIMIT: "50"
+      # كاش موديلات HF
       HF_HOME: "/root/.cache/huggingface"
       TOKENIZERS_PARALLELISM: "false"
       PYTHONIOENCODING: "utf-8"
     ports:
       - "5543:5543"
     volumes:
+      # اربط قاعدة Chroma من جهازك
       - ./chroma_db:/app/chroma_db:rw
+      # (اختياري) كاش هاجينج فيس لتقليل التحميلات
       - ./hf_cache:/root/.cache/huggingface:rw
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5543/health"]
