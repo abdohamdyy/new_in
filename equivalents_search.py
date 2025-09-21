@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 equivalents_search.py
-- إيجاد مثائل/بدائل لمنتج دوائي بناءً على:
+- إيجاد مثائل/بدائل لدواء بناءً على:
   * نفس المادة الفعّالة (أو احتوائها ضمن تركيبة)
   * نفس التركيز (± tolerance)
   * نفس الشكل الدوائي لو strict_form=True
 - يعتمد على مرشّح أولي بالبحث المتجهي (ChromaDB) + فلترة دقيقة على الميتاداتا
+- مزوّد بـ DEBUG logging علشان تعرف سبب رفض كل مرشّح من اللوجز.
 """
 
 from __future__ import annotations
+import os
 import re
+import logging
 import unicodedata
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -18,11 +21,24 @@ from chromadb.config import Settings
 from langchain_huggingface import HuggingFaceEmbeddings
 from config import Config
 
+# -------------------- Logger --------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger = logging.getLogger("equivalents")
+if not logger.handlers:
+    # خليه يطبع على STDOUT (هيبان في docker logs)
+    h = logging.StreamHandler()
+    fmt = logging.Formatter("[equivalents] %(levelname)s: %(message)s")
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
 # ====================== إعدادات افتراضية ======================
 DEFAULT_EQ_TOP_K = 800          # عدد المرشحين من المتجهات
 DEFAULT_EQ_MIN_BASE10 = 0.0     # أقل درجة أساسية للقبول (0..10)
 
-# نفس دالة تحويل المسافة لسكور من drug_search.py (للموضوعية في الترتيب)
+ACTIVE_FUZZY_MIN = 0.75         # الحد الأدنى للتشابه مع المادة
+
+# نفس دالة تحويل المسافة لسكور (0..10)
 def distance_to_score10(d: Optional[float]) -> float:
     if d is None: return 0.0
     s = (1.0 - (d / 2.0)) * 10.0
@@ -39,20 +55,6 @@ def normalize_ar(text: str) -> str:
                 .replace("ى","ي").replace("ة","ه")
                 .replace("ؤ","و").replace("ئ","ي"))
     return re.sub(r"\s+", " ", text).strip().lower()
-
-# ====================== تطبيع الشكل الدوائي ======================
-def normalize_form(value: str) -> str:
-    if not value: return ""
-    v = value.strip().lower()
-    if "قرص" in v or "اقراص" in v:        return "أقراص"
-    if "كبسول" in v or "كبسوله" in v:     return "كبسول"
-    if "شراب" in v or "syrup" in v:        return "شراب"
-    if "قطره" in v or "نقط" in v:         return "قطرة"
-    if "مرهم" in v:                        return "مرهم"
-    if "جل" in v:                          return "جل"
-    if "لبوس" in v or "تحميله" in v:      return "لبوس"
-    if "امبول" in v or "فيال" in v or "حقن" in v: return "أمبول"
-    return value.strip()
 
 # ====================== Parser للتراكيز ======================
 # أمثلة:
@@ -118,6 +120,7 @@ def get_scientific(meta: Dict[str, Any]) -> str:
     return ""
 
 def get_form(meta: Dict[str, Any]) -> str:
+    # أثناء البناء بيتسجل "pharma_form" (مهم) :contentReference[oaicite:0]{index=0}
     for k in ("pharma_form","الشكل الدوائي","form","dosage_form","pharmaceutical_form"):
         v = (meta or {}).get(k)
         if isinstance(v, str) and v.strip():
@@ -125,13 +128,70 @@ def get_form(meta: Dict[str, Any]) -> str:
     return ""
 
 def get_conc_text(meta: Dict[str, Any]) -> str:
-    # أثناء البناء بيتسجل المفتاح الإنجليزي "concentrations" (مهم جدًا)
-    # ولو لسه قبل البناء/مصدر خام، ابحث في "التراكيز"
+    # أثناء البناء بيتسجل المفتاح الإنجليزي "concentrations" (مهم جدًا) :contentReference[oaicite:1]{index=1}
     for k in ("concentrations","التراكيز"):
         v = (meta or {}).get(k)
         if isinstance(v, str) and v.strip():
             return v
     return ""
+
+# ====================== فزي على المادة ======================
+_SPLIT_ACTIVE = re.compile(r"[,\+\-/\(\)\[\]{}؛;،]|(?:\s+و\s+)|(?:\s+and\s+)", re.IGNORECASE)
+
+def extract_active_tokens(meta: Dict[str, Any]) -> List[str]:
+    parts = []
+    for k in ("scientific_name", "الاسم العلمي", "active_ingredients", "المواد الفعالة"):
+        val = (meta or {}).get(k)
+        if isinstance(val, str) and val.strip():
+            parts.append(val)
+    text = " ، ".join(parts)
+    raw_tokens = [t.strip() for t in _SPLIT_ACTIVE.split(text) if t and t.strip()]
+    tokens = []
+    for t in raw_tokens:
+        tn = normalize_ar(t)
+        if len(tn) >= 3:
+            tokens.append(tn)
+    return tokens
+
+def best_active_fuzzy_ratio(meta: Dict[str, Any], q_norm: str) -> Tuple[float, str]:
+    tokens = extract_active_tokens(meta)
+    best = 0.0
+    best_tok = ""
+    for t in tokens:
+        r = difflib.SequenceMatcher(None, t, q_norm).ratio()
+        if r > best:
+            best = r
+            best_tok = t
+    return best, best_tok
+
+# NB: هنستخدم مقارنة أبسط: احتواء الاسم بدل الفزي (الأبسط غالبًا أدق مع العربية)
+import difflib
+def contains_active(meta: Dict[str, Any], active_query_norm: str) -> Tuple[bool, str]:
+    tokens = extract_active_tokens(meta)
+    for t in tokens:
+        if active_query_norm in t:
+            return True, t
+    # fallback فزي
+    best = 0.0; best_tok = ""
+    for t in tokens:
+        r = difflib.SequenceMatcher(None, t, active_query_norm).ratio()
+        if r > best:
+            best = r; best_tok = t
+    return (best >= ACTIVE_FUZZY_MIN), best_tok
+
+# ====================== تطبيع الشكل الدوائي ======================
+def normalize_form(value: str) -> str:
+    if not value: return ""
+    v = value.strip().lower()
+    if "قرص" in v or "اقراص" in v:        return "أقراص"
+    if "كبسول" in v or "كبسوله" in v:     return "كبسول"
+    if "شراب" in v or "syrup" in v:        return "شراب"
+    if "قطره" in v or "نقط" in v:         return "قطرة"
+    if "مرهم" in v:                        return "مرهم"
+    if "جل" in v:                          return "جل"
+    if "لبوس" in v or "تحميله" in v:      return "لبوس"
+    if "امبول" in v or "فيال" in v or "حقن" in v: return "أمبول"
+    return value.strip()
 
 # ====================== فحص البديل ======================
 def is_equivalent_item(
@@ -142,6 +202,7 @@ def is_equivalent_item(
     allow_per_ml: bool = True,
     target_form: Optional[str] = None,
     strict_form: bool = True,
+    debug: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     يقرر إذا كان المنتج meta بديل صالح:
@@ -155,42 +216,47 @@ def is_equivalent_item(
     form_norm = normalize_form(str(form))
     if strict_form and target_form:
         if normalize_form(target_form) != form_norm:
+            if debug:
+                logger.debug(f"SKIP form mismatch: wanted={normalize_form(target_form)} found={form_norm} brand={get_brand(meta)}")
             return None
 
     # التراكيز
     conc_text = get_conc_text(meta)
     conc_list = parse_concentrations(conc_text)
+    if not conc_list and debug:
+        logger.debug(f"SKIP no concentrations parsed: brand={get_brand(meta)} conc_field='{conc_text[:80]}'")
 
     aq = normalize_ar(active_query)
-    def _match_active(x: str) -> bool:
-        # نطبع ونسمح بالاحتواء (عشان التركيبات)
-        return aq in normalize_ar(x)
 
     hit = None
     for c in conc_list:
-        if _match_active(c["drug"]):
+        if aq in normalize_ar(c["drug"]):
             hit = c
             break
     if not hit:
+        if debug:
+            logger.debug(f"SKIP no active hit: active='{active_query}' brand={get_brand(meta)}")
         return None
 
     # المقارنة على التركيز
     if hit["per_ml"] is not None:
         # ده منتج شراب/محلول
         if not allow_per_ml:
+            if debug:
+                logger.debug(f"SKIP per-ml not allowed: brand={get_brand(meta)}")
             return None
-        # لو الهدف أقراص والمرشح شراب ومع strict_form=True اتشال بالفعل فوق
-        # هنا هنرجّح تجاهل الشراب كبديل مباشر للقرص (إلا إذا strict_form=False)
         if strict_form:
+            if debug:
+                logger.debug(f"SKIP per-ml strict reject: brand={get_brand(meta)}")
             return None
-        # لو عايز توسّع: ممكن تقارن mg/5ml مقابل mg/قرص (حسب سياسة الجرعات عندك)
-        # حالياً هنعديه بشرط الشكل غير صارم
-        mg_match = True  # تخفيف القيود لو المستخدم سمح بالشكل المختلف
+        mg_match = True  # لو strict=False بنرخّي القيود
     else:
-        mg_match = abs(float(hit["mg"]) - float(target_mg)) <= float(tolerance_mg)
-
-    if not mg_match:
-        return None
+        mg = float(hit["mg"])
+        if abs(mg - float(target_mg)) > float(tolerance_mg):
+            if debug:
+                logger.debug(f"SKIP mg mismatch: target={target_mg}±{tolerance_mg} got={mg} brand={get_brand(meta)}")
+            return None
+        mg_match = True
 
     return {
         "match": {
@@ -198,7 +264,7 @@ def is_equivalent_item(
             "mg": float(hit["mg"]),
             "per_ml": hit["per_ml"],
             "form": form_norm,
-            "strength_hit": f"{hit['mg']} mg" if hit["per_ml"] is None else f"{hit['mg']} mg per {hit['per_ml']:.2f} mg/ml",
+            "strength_hit": f"{hit['mg']} mg" if hit["per_ml"] is None else f"{hit['mg']} mg per ml={hit['per_ml']:.2f}",
         }
     }
 
@@ -232,6 +298,7 @@ class EquivalentsFinder:
                 is_persistent=True,
             )
         )
+        # نفس اسم الكولكشن اللي اتبنى في البيلدر (Config.COLLECTION_NAME) :contentReference[oaicite:2]{index=2}
         self.collection = self.client.get_collection(collection_name)
 
         # نفس موديل التضمين وإعداداته المستخدمة في البناء والبحث (e5)
@@ -242,7 +309,7 @@ class EquivalentsFinder:
         )
 
     def _query_once(self, active_query: str, target_mg: float) -> Dict[str, Any]:
-        # بادئة "query: " مهمة مع e5
+        # بادئة "query: " مهمة مع e5 (زي drug_search.py) :contentReference[oaicite:3]{index=3}
         q_text = f"active ingredient: {active_query} strength: {target_mg} mg"
         q_emb = self.emb.embed_query(f"query: {q_text}")
         return self.collection.query(
@@ -260,6 +327,7 @@ class EquivalentsFinder:
         target_form: Optional[str] = None,
         strict_form: bool = True,
         limit: int = 50,
+        debug: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         يرجّع مثائل لها:
@@ -267,8 +335,9 @@ class EquivalentsFinder:
           - نفس التركيز ± tolerance
           - (اختياري) نفس الشكل بدقة لو strict_form=True
         """
-        if not active_query or target_mg is None:
-            return []
+        if debug:
+            logger.setLevel(logging.DEBUG)
+            logger.debug(f"REQ active='{active_query}' mg={target_mg} tol={tolerance_mg} form='{target_form}' strict={strict_form} allow_per_ml={allow_per_ml} topk={self.top_k} minbase={self.min_base10}")
 
         res = self._query_once(active_query, target_mg)
         ids_list   = res.get("ids", [[]])[0]
@@ -276,10 +345,16 @@ class EquivalentsFinder:
         metas_list = res.get("metadatas", [[]])[0]
         docs_list  = res.get("documents", [[]])[0]
 
+        if debug:
+            logger.debug(f"CANDIDATES via vector: {len(ids_list)}")
+
         rows: List[Dict[str, Any]] = []
+        dropped = {"base10":0, "active":0, "mg":0, "form":0, "perml":0, "noconc":0}
+
         for _id, dist, meta, doc in zip(ids_list, dists_list, metas_list, docs_list):
             base_score = distance_to_score10(dist)
             if base_score < self.min_base10:
+                dropped["base10"] += 1
                 continue
 
             ok = is_equivalent_item(
@@ -290,8 +365,11 @@ class EquivalentsFinder:
                 allow_per_ml=allow_per_ml,
                 target_form=target_form,
                 strict_form=strict_form,
+                debug=debug,
             )
             if not ok:
+                # تفصيل سبب الرفض تم طباعته في is_equivalent_item لو debug=True
+                # بنعدّها فقط
                 continue
 
             brand = get_brand(meta)
@@ -317,7 +395,7 @@ class EquivalentsFinder:
                 "form": form,
                 "match": ok["match"],      # فيه active/mg/per_ml/strength_hit/form
                 "meta": meta,              # كل الميتاداتا
-                "doc": doc,                # نص الوثيقة داخل Chroma (لو موجود)
+                "doc": doc,                # نص الوثيقة (لو موجود)
                 "tag": "equivalent"
             }
             rows.append(row)
@@ -326,4 +404,8 @@ class EquivalentsFinder:
         rows.sort(key=lambda x: x["base_score10"], reverse=True)
         if limit:
             rows = rows[:limit]
+
+        if debug:
+            logger.debug(f"RETURN {len(rows)} hits")
+
         return rows

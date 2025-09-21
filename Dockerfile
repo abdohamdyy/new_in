@@ -1,35 +1,37 @@
+# استخدم صورة Python خفيفة
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    TOKENIZERS_PARALLELISM=false \
-    HF_HOME=/root/.cache/huggingface
+# بيئة تشغيل
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-WORKDIR /app
-
-# أدوات لازمة لمكتبات ML
+# حزم نظام مطلوبة لبعض البايناريات (hnswlib/torch) والـ curl للـ healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl ca-certificates \
+    build-essential \
+    libgomp1 \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
-# انسخ السورس المهم كله
-COPY config.py .
-COPY drug_search.py .
-COPY equivalents_search.py .
-COPY app.py .
+# مجلد العمل
+WORKDIR /app
 
-# باكدجات البايثون (CPU)
-RUN pip install --no-cache-dir \
-    flask gunicorn \
-    chromadb \
-    langchain-huggingface \
-    transformers sentencepiece tokenizers \
-    sentence-transformers \
-    torch
+# نسخ requirements وتثبيت
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip \
+ && pip install -r /app/requirements.txt
 
+# نسخ كود التطبيق
+COPY . /app
+
+# المنفذ
 EXPOSE 5543
 
-# شغّل بـ gunicorn على 5543 مع لوجات واضحة
-CMD ["gunicorn", "--bind", "0.0.0.0:5543", "--workers", "2", "--threads", "4", "--timeout", "180", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+# أمر التشغيل (Gunicorn)
+# 4 عُمّال + 8 ثريدز — عدّل زي ما تحب حسب السيرفر
+CMD gunicorn -w 4 -k gthread --threads 8 \
+    -b 0.0.0.0:${PORT:-5543} \
+    app:app \
+    --access-logfile - \
+    --error-logfile - \
+    --timeout 120

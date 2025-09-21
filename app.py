@@ -2,10 +2,19 @@
 from __future__ import annotations
 import os
 import json
+import logging
 from flask import Flask, request, jsonify
 
 from drug_search import DrugSearch, DEFAULT_TOP_K, DEFAULT_MIN_SCORE10
-from equivalents_search import EquivalentsFinder  # <— جديد
+from equivalents_search import EquivalentsFinder  # ملف المثائل
+
+# ================= إعداد اللوجينغ =================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(levelname)s: %(message)s"
+)
+logger = logging.getLogger("duaya_api")
 
 app = Flask(__name__)
 
@@ -36,7 +45,7 @@ def parse_bool(val, default: bool) -> bool:
 def health():
     return jsonify({"ok": True})
 
-# ================= بحث الاسم التجاري (قائم) =================
+# ================= بحث الاسم التجاري =================
 @app.get("/search")
 def search_get():
     """
@@ -59,14 +68,14 @@ def search_get():
             mimetype="application/json; charset=utf-8",
         )
     except Exception as e:
+        logger.exception("search_get failed")
         return jsonify({"error": str(e)}), 500
 
 @app.post("/search")
 def search_post():
     """
     POST /search
-    Body (JSON): {"query": "اسم الدواء", "limit": 50, "minscore": 5, "topk": 400}
-    بيركّز على query واحدة فقط.
+    Body: {"query":"اسم الدواء","limit":50,"minscore":5,"topk":400}
     """
     if not request.is_json:
         return jsonify({"error": "expected application/json body"}), 400
@@ -87,19 +96,21 @@ def search_post():
             mimetype="application/json; charset=utf-8",
         )
     except Exception as e:
+        logger.exception("search_post failed")
         return jsonify({"error": str(e)}), 500
 
-# ==================== Endpoints المثائل (جديدة) ====================
+# ==================== Endpoints المثائل ====================
 @app.get("/equivalents")
 def equivalents_get():
     """
-    GET /equivalents?active=باراسيتامول&mg=500&form=أقراص&tol=0&allow_per_ml=true&strict_form=true&limit=50&topk=800&minbase=0
+    GET /equivalents?active=باراسيتامول&mg=500&form=أقراص&tol=0&allow_per_ml=true&strict_form=true&limit=50&topk=800&minbase=0&debug=1
     - active: إجباري (المادة الفعّالة/الاسم العلمي)
     - mg: إجباري (تركيز بالمليجرام)
     - form: اختياري (أقراص/كبسول/شراب/أمبول/...)
+    - debug: اختياري (لو true يطلع لوجز تفصيلية في docker logs)
     """
     active = request.args.get("active", type=str)
-    mg = request.args.get("mg", type=str)  # ناخدها كنص ثم نعمل float بإيدينا علشان رسائل الخطأ
+    mg = request.args.get("mg", type=str)
     if not active or not active.strip():
         return jsonify({"error": "missing 'active' parameter"}), 400
     try:
@@ -114,9 +125,13 @@ def equivalents_get():
     limit = request.args.get("limit", type=int) or EQ_LIMIT
     topk = request.args.get("topk", type=int) or EQ_TOP_K
     minbase = request.args.get("minbase", type=float) or EQ_MIN_BASE10
+    debug_flag = parse_bool(request.args.get("debug"), False)
 
     try:
-        # نستخدم instance مختلف لو غيّر المستخدم topk/minbase في الطلب الحالي
+        if debug_flag:
+            logger.setLevel(logging.DEBUG)
+        logger.info(f"/equivalents GET active='{active}' mg={mg_val} form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
+
         local_finder = eq_finder
         if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
             local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
@@ -129,20 +144,23 @@ def equivalents_get():
             target_form=form,
             strict_form=strict_form,
             limit=limit,
+            debug=debug_flag,
         )
+        logger.info(f"/equivalents -> {len(results)} results")
         return app.response_class(
             response=json.dumps(results, ensure_ascii=False),
             status=200,
             mimetype="application/json; charset=utf-8",
         )
     except Exception as e:
+        logger.exception("equivalents_get failed")
         return jsonify({"error": str(e)}), 500
 
 @app.post("/equivalents")
 def equivalents_post():
     """
     POST /equivalents
-    Body JSON مثال:
+    Body مثال:
       {
         "active": "باراسيتامول",
         "mg": 500,
@@ -152,7 +170,8 @@ def equivalents_post():
         "strict_form": true,
         "limit": 50,
         "topk": 800,
-        "minbase": 0.0
+        "minbase": 0.0,
+        "debug": true
       }
     """
     if not request.is_json:
@@ -175,8 +194,13 @@ def equivalents_post():
     limit = int(payload.get("limit") or EQ_LIMIT)
     topk = int(payload.get("topk") or EQ_TOP_K)
     minbase = float(payload.get("minbase") or EQ_MIN_BASE10)
+    debug_flag = parse_bool(payload.get("debug"), False)
 
     try:
+        if debug_flag:
+            logger.setLevel(logging.DEBUG)
+        logger.info(f"/equivalents POST active='{active}' mg={mg_val} form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
+
         local_finder = eq_finder
         if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
             local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
@@ -189,16 +213,19 @@ def equivalents_post():
             target_form=form,
             strict_form=strict_form,
             limit=limit,
+            debug=debug_flag,
         )
+        logger.info(f"/equivalents -> {len(results)} results")
         return app.response_class(
             response=json.dumps(results, ensure_ascii=False),
             status=200,
             mimetype="application/json; charset=utf-8",
         )
     except Exception as e:
+        logger.exception("equivalents_post failed")
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # شغّل السيرفر المحلي (جوّه Docker بنستخدم gunicorn)
+    # في التطوير بنستخدم Flask مباشرة؛ داخل Docker يفضل gunicorn
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5543")), debug=False)

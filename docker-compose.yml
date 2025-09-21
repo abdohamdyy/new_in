@@ -1,33 +1,47 @@
+version: "3.9"
+
 services:
-  duaya-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: duaya-api:latest
+  duaya_api:
+    build: .
     container_name: duaya_api
-    restart: unless-stopped
+    # لو عندك .env هيتحمّل تلقائيًا؛ وبرضه ندي شوية defaults هنا
     environment:
-      # إعدادات البحث بالاسم التجاري
-      SEARCH_TOP_K: "400"
-      SEARCH_MIN_SCORE10: "5.0"
-      SEARCH_LIMIT: "50"
-      # إعدادات المثائل (equivalents)
-      EQ_TOP_K: "800"
-      EQ_MIN_BASE10: "0.0"
-      EQ_LIMIT: "50"
-      # كاش موديلات HF
-      HF_HOME: "/root/.cache/huggingface"
-      TOKENIZERS_PARALLELISM: "false"
-      PYTHONIOENCODING: "utf-8"
+      PORT: "5543"
+      LOG_LEVEL: "INFO"    # حطها "DEBUG" لو عايز لوجز تفصيلية
+      # SEARCH_TOP_K: "400"
+      # SEARCH_MIN_SCORE10: "5.0"
+      # EQ_TOP_K: "800"
+      # EQ_MIN_BASE10: "0.0"
     ports:
       - "5543:5543"
     volumes:
-      # اربط قاعدة Chroma من جهازك
-      - ./chroma_db:/app/chroma_db:rw
-      # (اختياري) كاش هاجينج فيس لتقليل التحميلات
-      - ./hf_cache:/root/.cache/huggingface:rw
+      # خزن قاعدة ChromaDB على الهوسـت عشان تفضل محفوظة
+      - ./chroma_db:/app/chroma_db
+      # اختياري: مجلد لوجز لو عايز تحفظها على الهوسـت
+      - ./logs:/app/logs
+    command: >
+      gunicorn -w 4 -k gthread --threads 8
+      -b 0.0.0.0:${PORT}
+      app:app
+      --access-logfile -
+      --error-logfile -
+      --timeout 120
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:5543/health"]
-      interval: 20s
-      timeout: 5s
+      test: ["CMD", "curl", "-f", "http://localhost:5543/health"]
+      interval: 10s
+      timeout: 3s
       retries: 5
+    restart: unless-stopped
+
+  # اختياري: خدمة تبني قاعدة Chroma مرة واحدة (شغّلها يدويًا عند الحاجة)
+  # db_build:
+  #   build: .
+  #   container_name: duaya_db_build
+  #   environment:
+  #     LOG_LEVEL: "INFO"
+  #   volumes:
+  #     - ./chroma_db:/app/chroma_db
+  #     - ./logs:/app/logs
+  #     - ./:/app  # للوصول إلى merged_data.json والسكربت
+  #   command: python build_optimized_db.py
+  #   profiles: ["builder"]
