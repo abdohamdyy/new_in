@@ -9,9 +9,10 @@ equivalents_search.py
 (التركيز لا يُستخدم في الاسترجاع.. هنستخدمه لاحقًا في الفرز)
 
 📊 استراتيجية الفرز (Ranking in response):
-- أعلى أولوية: النتائج التي تحتوي رقم تركيز يساوي target_mg "بالظبط"
+- أولاً: النتائج المرتبطة علميًا (active/scientific ≥ 0.70)
+- داخل المرتبطين علميًا: النتائج التي تحتوي رقم تركيز يساوي target_mg "بالظبط"
 - بعد ذلك: ترتيب عادي حسب final_score (vector + fuzzy: active > scientific > brand)
-- لا نستخدم التركيز كبونص، بل كشرط sorting أولي (tie-breaker قوي)
+- ثم tie-break بالـ base_score10
 
 يحافظ على نفس أسلوب drug_search.py:
 - normalize_ar
@@ -51,6 +52,9 @@ FORM_SOFT_BONUS         = 0.2   # strict=False
 # إعدادات الاسترجاع من Chroma
 DEFAULT_EQ_TOP_K        = 800
 DEFAULT_MIN_BASE10      = 0.0
+
+# عتبة اعتبار النتيجة "مرتبطة علميًا"
+RELEVANT_MIN            = 0.70
 
 # ======================= تطبيع وأدوات عامة =======================
 _ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06ED]")
@@ -214,7 +218,7 @@ def has_exact_concentration(meta: Dict[str, Any], active_norm: str, target_mg: f
 class EquivalentsFinder:
     """
     - الاسترجاع: Active/Scientific أولًا → Scientific-only → Brand
-    - الفرز النهائي: exact concentration match أولًا، ثم final_score
+    - الفرز النهائي: المرتبط علميًا أولًا، ثم exact concentration match، ثم final_score
     """
 
     def __init__(
@@ -288,17 +292,18 @@ class EquivalentsFinder:
         - يبني تجميعة موحّدة للمرشحين (أفضل مسافة base لكل id)
         - يحسب bonus (active/scientific/brand + form)
         - يفرز أخيرًا كالتالي:
-            (1) exact concentration match = True أولًا
-            (2) ثم final_score أعلى
-            (3) tie-break: base_score10 أعلى
+            (1) المرتبط علميًا أولًا (active/scientific ≥ RELEVANT_MIN)
+            (2) داخلهم: exact concentration match = True
+            (3) ثم final_score أعلى
+            (4) tie-break: base_score10 أعلى
         """
         if not active_query:
             return []
 
         # 1) اجمع مرشحين من الاستعلامات بالترتيب
-        q_active = self._query_active_first(active_query)
-        q_science = self._query_scientific_only(active_query)
-        q_brand = self._query_brand(active_query)
+        q_active   = self._query_active_first(active_query)
+        q_science  = self._query_scientific_only(active_query)
+        q_brand    = self._query_brand(active_query)
 
         pools = [q_active, q_science, q_brand]
 
@@ -315,7 +320,7 @@ class EquivalentsFinder:
 
         q_norm = normalize_ar(active_query)
 
-        # 3) ابنِ الصفوف مع البونصات (بدون بونص تركيز — هنستخدمه للفرز فقط)
+        # 3) ابنِ الصفوف مع البونصات (بدون بونص تركيز — سنستخدمه للفرز فقط)
         rows: List[Dict[str, Any]] = []
         for _id, pack in merged.items():
             dist = pack["dist"]
@@ -337,7 +342,7 @@ class EquivalentsFinder:
                 bonus += FORM_MATCH_BONUS if strict_form else FORM_SOFT_BONUS
                 tag_parts.append("form_match")
 
-            # المواد الفعّالة (أعلى من العلمي)
+            # المواد الفعّالة
             a_ratio, a_tok = best_active_fuzzy_ratio(meta, q_norm)
             if a_ratio >= ACTIVE_FUZZY_MIN:
                 bonus += ACTIVE_BASE_BOOST * a_ratio
@@ -374,9 +379,14 @@ class EquivalentsFinder:
             else:
                 tag_parts.append("brand_miss")
 
-            # فحص التطابق العددي للتركيز (للفرز فقط)
+            # فحص الارتباط العلمي العام:
+            is_relevant = (a_ratio >= RELEVANT_MIN) or (sci_ratio >= RELEVANT_MIN)
+
+            # فحص التطابق العددي للتركيز (للفرز فقط، وداخل المرتبطين علميًا فقط)
             active_norm = q_norm
-            conc_exact, conc_num = has_exact_concentration(meta, active_norm, target_mg)
+            conc_exact, conc_num = (False, None)
+            if is_relevant:
+                conc_exact, conc_num = has_exact_concentration(meta, active_norm, target_mg)
 
             row = {
                 "id": _id,
@@ -393,16 +403,19 @@ class EquivalentsFinder:
                 "meta": meta,
                 "doc": doc,
                 # مفاتيح مساعدة للفرز النهائي:
-                "_conc_exact": bool(conc_exact),
+                "_relevant": is_relevant,
+                "_conc_exact": bool(conc_exact) if is_relevant else False,
                 "_conc_num": conc_num,
             }
             rows.append(row)
 
         # 4) الفرز النهائي:
-        #   - أولًا: اللي عندها _conc_exact == True
-        #   - بعدين: final_score أعلى
-        #   - بعدين: base_score10 أعلى
+        #   - المرتبطون علميًا أولاً
+        #   - داخلهم: المطابقون في التركيز
+        #   - ثم: final_score أعلى
+        #   - ثم: base_score10 أعلى
         rows.sort(key=lambda x: (
+            0 if x.get("_relevant") else 1,
             0 if x.get("_conc_exact") else 1,
             -(x["final_score"]),
             -(x["base_score10"])
@@ -410,6 +423,7 @@ class EquivalentsFinder:
 
         # تنظيف المفاتيح المساعدة قبل الإرجاع + limit
         for r in rows:
+            r.pop("_relevant", None)
             r.pop("_conc_exact", None)
             r.pop("_conc_num", None)
 
