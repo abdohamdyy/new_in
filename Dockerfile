@@ -1,35 +1,34 @@
-FROM python:3.11-slim
+# ===== Base =====
+FROM python:3.11-slim AS base
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    TOKENIZERS_PARALLELISM=false \
-    HF_HOME=/root/.cache/huggingface
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# أدوات لازمة لمكتبات ML
+# اختياري: أدوات بناء خفيفة (لو مكتبتك تحتاج)
+# تقدر تشيل build-essential لو مش محتاج
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+    build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# انسخ السورس المهم كله
-COPY config.py .
-COPY drug_search.py .
-COPY equivalents_search.py .
-COPY app.py .
-
-# باكدجات البايثون (CPU)
-RUN pip install --no-cache-dir \
-    flask gunicorn \
-    chromadb \
-    langchain-huggingface \
-    transformers sentencepiece tokenizers \
-    sentence-transformers \
-    torch
+# نزّل المتطلبات لو موجودة (مرن: لو مفيش requirements مش هيكسر)
+COPY requirements*.txt /tmp/ 2>/dev/null || true
+RUN python -m pip install --upgrade pip && \
+    if [ -f /tmp/requirements.txt ]; then pip install -r /tmp/requirements.txt; fi && \
+    if [ -f /tmp/requirements-dev.txt ]; then pip install -r /tmp/requirements-dev.txt; fi
 
 EXPOSE 5543
 
-# شغّل بـ gunicorn على 5543 مع لوجات واضحة
-CMD ["gunicorn", "--bind", "0.0.0.0:5543", "--workers", "2", "--threads", "4", "--timeout", "180", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+# ===== Development =====
+FROM base AS dev
+# في التطوير هنربط الكود بـ bind mount من الـ compose،
+# لكن بنعمل COPY احتياطي لو حد شغّل الصورة من غير compose.
+COPY . /app
+
+# ===== Production =====
+FROM base AS prod
+COPY . /app
+# الافتراضي للإنتاج (compose في التطوير بيستبدل الـ command)
+CMD ["gunicorn", "-w", "4", "-k", "gthread", "--threads", "8", "-b", "0.0.0.0:5543", "app:app", "--access-logfile", "-", "--error-logfile", "-", "--timeout", "120"]

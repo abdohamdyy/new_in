@@ -1,32 +1,47 @@
+version: "3.9"
+
 services:
   duaya_api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: duaya-api:latest
+      # تقدر تشيل السطر ده لو مش هتستخدم stages، بس سيبه عادي
+      target: dev
+    image: duaya-api:dev
     container_name: duaya_api
     restart: unless-stopped
+
     environment:
-      LOG_LEVEL: "INFO"          # خليه DEBUG وقت التشخيص
-      # SEARCH_TOP_K: "400"
-      # SEARCH_MIN_SCORE10: "5.0"
-      # EQ_TOP_K: "800"
-      # EQ_MIN_BASE10: "0.0"
+      # نفس متغيّراتك + تمكين وضع التطوير
+      LOG_LEVEL: "DEBUG"
       PYTHONIOENCODING: "utf-8"
       TOKENIZERS_PARALLELISM: "false"
+      FLASK_ENV: development
+      DEBUG: "true"
+
     ports:
       - "5543:5543"
+
+    # أهم نقطة: نعمل bind mount لفولدر المشروع كله جوّا /app
+    # + باقي المجلدات الدائمة اللي عندك أصلاً
     volumes:
-      - ./chroma_db:/app/chroma_db:rw               # تخزين ChromaDB على الهوسـت
-      - ./hf_cache:/root/.cache/huggingface:rw      # اختياري: كاش الموديلات
-      - ./logs:/app/logs:rw                         # اختياري: لوجز
+      - ./:/app:rw
+      - ./chroma_db:/app/chroma_db:rw
+      - ./hf_cache:/root/.cache/huggingface:rw
+      - ./logs:/app/logs:rw
+
+    # Gunicorn مع --reload عشان يلتقط أي تغييرات في الملفات
+    # عاملين worker واحد بس في التطوير لتسريع إعادة التحميل
     command: >
-      gunicorn -w 4 -k gthread --threads 8
+      gunicorn -w 1 --reload --reload-engine=auto
+      -k gthread --threads 8
       -b 0.0.0.0:5543
       app:app
       --access-logfile -
       --error-logfile -
       --timeout 120
+      --log-level ${LOG_LEVEL}
+
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5543/health"]
       interval: 20s
