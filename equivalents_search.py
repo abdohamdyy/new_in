@@ -1,13 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-equivalents_search.py (rev: learn-from-drug_search)
-- إيجاد بدائل حسب المادة الفعّالة + التركيز (+ الشكل لو مطلوب)
-- مستلهم من منطق drug_search: نعتمد fuzzy matching على نصوص الحقول بدل المطابقة الحرفية
-- لا نحتاج قوائم مرادفات يدوية؛ بنستخدم تطبيع + فَزّي توكِني
+equivalents_search.py
+
+🔎 استراتيجية البحث (Querying Order):
+1) نبحث بالمواد الفعّالة أولًا (active_ingredients) + scientific hint
+2) ثم الاسم العلمي فقط
+3) ثم الاسم التجاري/الاسم (brand/commercial)
+(التركيز لا يُستخدم في الاسترجاع.. هنستخدمه لاحقًا في الفرز)
+
+📊 استراتيجية الفرز (Ranking in response):
+- أعلى أولوية: النتائج التي تحتوي رقم تركيز يساوي target_mg "بالظبط"
+- بعد ذلك: ترتيب عادي حسب final_score (vector + fuzzy: active > scientific > brand)
+- لا نستخدم التركيز كبونص، بل كشرط sorting أولي (tie-breaker قوي)
+
+يحافظ على نفس أسلوب drug_search.py:
+- normalize_ar
+- distance_to_score10
+- نفس هيكل الخرج: id/query/base_score10/final_score/bonus/tag/.../meta/doc
 """
 
 from __future__ import annotations
-import os, re, json, logging, unicodedata, difflib
+import re
+import unicodedata
+import difflib
 from typing import List, Dict, Any, Optional, Tuple
 
 import chromadb
@@ -15,25 +30,36 @@ from chromadb.config import Settings
 from langchain_huggingface import HuggingFaceEmbeddings
 from config import Config
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logger = logging.getLogger("equivalents")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[equivalents] %(levelname)s: %(message)s"))
-    logger.addHandler(h)
-logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+# ======================= ثوابت وأوزان =======================
+# أوزان البونصات: المواد الفعّالة أعلى من العلمي، والعلمي أعلى من التجاري
+ACTIVE_FUZZY_MIN        = 0.70
+ACTIVE_BASE_BOOST       = 1.4
+ACTIVE_STRONG_BOOST     = 1.6   # r>=0.90
 
-DEFAULT_EQ_TOP_K = 800
-DEFAULT_EQ_MIN_BASE10 = 0.0
+SCIENTIFIC_FUZZY_MIN    = 0.70
+SCIENTIFIC_BASE_BOOST   = 1.0
+SCIENTIFIC_STRONG_BOOST = 1.2   # r>=0.90
 
-# ---------- Utils ----------
-def distance_to_score10(d: Optional[float]) -> float:
-    if d is None: return 0.0
-    return max(0.0, min(10.0, (1.0 - (d/2.0)) * 10.0))
+BRAND_FUZZY_MIN         = 0.70
+BRAND_BASE_BOOST        = 0.7
+BRAND_STRONG_BOOST      = 1.0   # r>=0.90 أو طول قريب
 
-_ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
+# الشكل الدوائي
+FORM_MATCH_BONUS        = 0.6   # strict=True
+FORM_SOFT_BONUS         = 0.2   # strict=False
+
+# إعدادات الاسترجاع من Chroma
+DEFAULT_EQ_TOP_K        = 800
+DEFAULT_MIN_BASE10      = 0.0
+
+# ======================= تطبيع وأدوات عامة =======================
+_ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06ED]")
+AR_CHARS = "ء-ي"
+_NON_WORD = re.compile(rf"[^\w{AR_CHARS}]+", re.UNICODE)
+
 def normalize_ar(text: str) -> str:
-    if not isinstance(text, str): return ""
+    if not isinstance(text, str):
+        return ""
     text = unicodedata.normalize("NFKC", text)
     text = _ARABIC_DIACRITICS.sub("", text)
     text = (text.replace("أ","ا").replace("إ","ا").replace("آ","ا")
@@ -41,231 +67,176 @@ def normalize_ar(text: str) -> str:
                  .replace("ؤ","و").replace("ئ","ي"))
     return re.sub(r"\s+", " ", text).strip().lower()
 
-def normalize_form(v: str) -> str:
-    if not v: return ""
-    v = v.strip().lower()
-    if "قرص" in v or "اقراص" in v:        return "أقراص"
-    if "كبسول" in v or "كبسوله" in v:     return "كبسول"
-    if "شراب" in v or "syrup" in v:        return "شراب"
-    if "قطره" in v or "نقط" in v:         return "قطرة"
-    if "مرهم" in v:                        return "مرهم"
-    if "جل" in v:                          return "جل"
-    if "لبوس" in v or "تحميله" in v:      return "لبوس"
-    if "امبول" in v or "فيال" in v or "حقن" in v: return "أمبول"
-    return v.strip()
+def distance_to_score10(d: Optional[float]) -> float:
+    """حوّل مسافة كوساين (0..2) إلى درجة 0..10 (نفس drug_search)."""
+    if d is None:
+        return 0.0
+    s = (1.0 - (d / 2.0)) * 10.0
+    return max(0.0, min(10.0, float(s)))
 
-ACTIVE_KEYS = (
-    "scientific_name","الاسم العلمي",
-    "active_ingredients","المواد الفعالة",
-)
-FORM_KEYS = ("pharma_form","الشكل الدوائي","form","dosage_form","pharmaceutical_form")
-STRENGTH_KEYS = (
-    "concentrations","التراكيز",
-    "strength","dose_strength","dosage_strength","التركيز","تركيز",
-    "name","اسم الدواء الأصلي","commercial_name","الاسم التجاري",
-)
+# ======================= Active / Scientific =======================
+_SPLIT_ACTIVE = re.compile(r"[,\+\-/\(\)\[\]{}؛;،]|(?:\s+و\s+)|(?:\s+and\s+)", re.IGNORECASE)
 
-def get_first_str(meta: Dict[str,Any], keys: Tuple[str,...]) -> str:
-    for k in keys:
-        v = (meta or {}).get(k)
-        if isinstance(v, str) and v.strip(): return v
+def extract_active_tokens(meta: Dict[str, Any]) -> List[str]:
+    """يستخرج توكنز من المواد الفعّالة + يعيد العلمي كتوكِن مستقل."""
+    parts_active = []
+    v1 = (meta or {}).get("active_ingredients") or (meta or {}).get("المواد الفعالة")
+    if isinstance(v1, str) and v1.strip():
+        parts_active.append(v1)
+
+    tokens_active: List[str] = []
+    if parts_active:
+        text = " ، ".join(parts_active)
+        raw_tokens = [t.strip() for t in _SPLIT_ACTIVE.split(text) if t and t.strip()]
+        for t in raw_tokens:
+            tn = normalize_ar(t)
+            if len(tn) >= 2:
+                tokens_active.append(tn)
+
+    sci = (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي") or ""
+    sci_norm = normalize_ar(sci) if isinstance(sci, str) else ""
+
+    return tokens_active + ([sci_norm] if sci_norm else [])
+
+def best_active_fuzzy_ratio(meta: Dict[str, Any], q_norm: str) -> Tuple[float, str]:
+    """أفضل تطابق فزي ضمن (المواد الفعّالة + العلمي كتوكِن)."""
+    toks = extract_active_tokens(meta)
+    best = 0.0
+    best_tok = ""
+    for t in toks:
+        r = difflib.SequenceMatcher(None, t, q_norm).ratio()
+        if r > best:
+            best = r
+            best_tok = t
+    return best, best_tok
+
+def fuzzy_ratio_on_scientific_only(meta: Dict[str, Any], q_norm: str) -> float:
+    sci = (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي") or ""
+    sci_norm = normalize_ar(sci) if isinstance(sci, str) else ""
+    if not sci_norm or not q_norm:
+        return 0.0
+    return difflib.SequenceMatcher(None, sci_norm, q_norm).ratio()
+
+# ======================= Brand / Commercial =======================
+NAME_KEYS = [
+    "commercial_name", "الاسم التجاري", "الاسم_التجاري",
+    "name", "اسم الدواء الأصلي",
+    "scientific_name", "الاسم العلمي",
+]
+def best_brand_field(meta: Dict[str, Any]) -> str:
+    for k in NAME_KEYS:
+        val = (meta or {}).get(k)
+        if isinstance(val, str) and val.strip():
+            return val
     return ""
 
-def get_form(meta: Dict[str,Any]) -> str: return get_first_str(meta, FORM_KEYS)
-def get_brand(meta: Dict[str,Any]) -> str:
-    return get_first_str(meta, ("commercial_name","الاسم التجاري","الاسم_التجاري","name","اسم الدواء الأصلي"))
-
-def blob_active_text(meta: Dict[str,Any]) -> str:
-    parts=[]
-    for k in ACTIVE_KEYS:
-        v=meta.get(k)
-        if isinstance(v,str) and v.strip(): parts.append(v)
-    # fallback: أحيانًا المادة تظهر داخل الاسم
-    vb = get_first_str(meta, ("name","اسم الدواء الأصلي","commercial_name","الاسم التجاري"))
-    if vb: parts.append(vb)
-    return " ، ".join(parts)
-
-# ---------- Strength parsing ----------
-_CONC_RE = re.compile(r"""
-    (?P<drug>[^,\u061B\u060C؛\n\r]+?)\s*
-    (?P<amt>\d+(?:\.\d+)?)\s*
-    (?P<unit>ملغ|مجم|mg|mcg|ميكروغرام|جم|g)?\s*
-    (?:/\s*(?P<per>\d+(?:\.\d+)?)\s*(?:مل|ml))?
-""", re.VERBOSE | re.IGNORECASE)
-
-def _to_mg(amount: float, unit: Optional[str]) -> float:
-    if not unit: return amount
-    u=unit.lower()
-    if u in ("ملغ","مجم","mg"): return amount
-    if u in ("mcg","ميكروغرام"): return amount/1000.0
-    if u in ("جم","g"): return amount*1000.0
-    return amount
-
-def extract_strengths(meta: Dict[str,Any]) -> List[Dict[str,Any]]:
-    blobs=[]
-    for k in STRENGTH_KEYS:
-        v=meta.get(k)
-        if isinstance(v,str) and v.strip() and v.strip()!="غير متوفر":
-            blobs.append(v)
-    text=" ، ".join(blobs)
-    out=[]
-    for m in _CONC_RE.finditer(text):
-        drug=(m.group("drug") or "").strip(" -\u061F\u061B\u060C،")
-        if not drug: continue
-        amt=float(m.group("amt")); unit=m.group("unit") or "mg"
-        per=m.group("per"); mg=_to_mg(amt,unit)
-        per_ml=None
-        if per:
-            try:
-                vol=float(per)
-                if vol>0: per_ml=mg/vol
-            except Exception:
-                pass
-        out.append({"drug":drug, "mg":mg, "per_ml":per_ml})
-    return out
-
-# ---------- Fuzzy like drug_search ----------
-_SPLIT_TOK = re.compile(r"[,\+\-/\(\)\[\]{}؛;،]|(?:\s+و\s+)|(?:\s+and\s+)|\s+")
-
-def token_fuzzy_max(q: str, text: str) -> float:
-    """أعلى درجة فَزّي بين q وبين أي توكن/عبارة قصيرة داخل text."""
-    if not q or not text: return 0.0
-    qn = normalize_ar(q)
-    tn = normalize_ar(text)
-    toks = [t for t in _SPLIT_TOK.split(tn) if t and len(t)>=2]
-    if not toks: toks=[tn]
-    best=0.0
-    for t in toks:
-        r = difflib.SequenceMatcher(None, qn, t).ratio()
-        if r>best: best=r
-    # جرّب سلاسل قصيرة من كلمتين متجاورتين (يلتقط "حمض فلاني")
-    words = [w for w in tn.split(" ") if w]
-    for i in range(len(words)-1):
-        big = words[i]+" "+words[i+1]
-        r = difflib.SequenceMatcher(None, qn, big).ratio()
-        if r>best: best=r
+def brand_best_token_ratio(brand: str, q_norm: str) -> Tuple[float, str, float]:
+    """فزي على مستوى توكن من الاسم التجاري + عقوبة طول خفيفة."""
+    v = normalize_ar(brand)
+    if not v or not q_norm:
+        return 0.0, "", 1.0
+    tokens = [t for t in _NON_WORD.split(v) if t]
+    best = (0.0, "", 1.0)
+    for t in tokens:
+        ratio = difflib.SequenceMatcher(None, t, q_norm).ratio()
+        rel_extra = max(0, len(t) - len(q_norm)) / max(len(t), 1)
+        penalty = 1.0 - min(0.30, rel_extra)  # 0.7..1.0
+        if t.startswith(q_norm) or t.endswith(q_norm):
+            ratio = min(1.0, ratio + 0.05)
+        if ratio * penalty > best[0] * best[2]:
+            best = (ratio, t, penalty)
     return best
 
-def has_active_fuzzy(meta: Dict[str,Any], active_query: str, doc: Optional[str]) -> Tuple[bool, float, str]:
-    """يرجع (hit?, score, source) حيث المصدر = meta/brand/doc."""
-    blob = blob_active_text(meta)
-    s1 = token_fuzzy_max(active_query, blob)
-    s2 = token_fuzzy_max(active_query, get_brand(meta))
-    s3 = token_fuzzy_max(active_query, doc or "")
-    best = max(s1, s2, s3)
-    # قبول لو:
-    # - وجود substring صريح
-    aqn = normalize_ar(active_query)
-    if aqn and (aqn in normalize_ar(blob) or aqn in normalize_ar(get_brand(meta))):
-        return True, max(best, 1.0), "substr"
-    # - أو فَزّي قوي >= 0.78 (قابل للتعديل)
-    if best >= 0.78:
-        return True, best, "fuzzy"
-    return False, best, "none"
+# ======================= التركيز (أرقام فقط) =======================
+NUM_PATTERN = re.compile(r"\d+(?:\.\d+)?")
 
-def is_probably_drug(meta: Dict[str,Any]) -> bool:
-    # لازم على الأقل عنده scientific/active_ingredients أو تصنيف دوائي
-    if any(isinstance(meta.get(k), str) and meta.get(k).strip() and meta.get(k).strip()!="غير متوفر"
-           for k in ("scientific_name","الاسم العلمي","active_ingredients","المواد الفعالة")):
-        return True
-    if any(isinstance(meta.get(k), str) and meta.get(k).strip()
-           for k in ("التصنيف الدوائي","drug_class","القسم")):
-        return True
-    return False
+def grab_all_numbers(text: str) -> List[float]:
+    if not text:
+        return []
+    return [float(x) for x in NUM_PATTERN.findall(str(text))]
 
-def is_equivalent_item(
-    meta: Dict[str,Any],
-    active_query: str,
-    target_mg: float,
-    tolerance_mg: float=0.0,
-    allow_per_ml: bool=True,
-    target_form: Optional[str]=None,
-    strict_form: bool=True,
-    debug: bool=False,
-    doc: Optional[str]=None,
-) -> Optional[Dict[str,Any]]:
+def collect_concentration_texts(meta: Dict[str, Any]) -> str:
+    """
+    نجمع كل الحقول التي قد تحتوي أرقام تركيز:
+      - concentrations/التراكيز
+      - name/اسم الدواء الأصلي
+      - active_ingredients/المواد الفعالة
+      - dosage/الجرعة المعتادة
+    """
+    parts = []
+    for k in ("concentrations", "التراكيز",
+              "name", "اسم الدواء الأصلي",
+              "active_ingredients", "المواد الفعالة",
+              "dosage", "الجرعة المعتادة"):
+        v = (meta or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            parts.append(v)
+    return " | ".join(parts)
 
-    brand=get_brand(meta)
-
-    # 1) pre-check: لازم يكون شكله دواء
-    if not is_probably_drug(meta):
-        if debug: logger.debug(f"SKIP not a drug-like item: brand={brand}")
+def find_number_near_active(text: str, active_norm: str, window: int = 25) -> Optional[float]:
+    """
+    نحاول نلقط رقم قريب من اسم المادة المطلوبة داخل نافذة حروف.
+    مثال: '... باراسيتامول (500 مجم) ...' → نلتقط 500.
+    """
+    if not text or not active_norm:
         return None
+    t = normalize_ar(str(text))
+    for m in re.finditer(re.escape(active_norm), t):
+        start, end = m.span()
+        l_ctx = max(0, start - window)
+        r_ctx = min(len(t), end + window)
+        ctx = t[l_ctx:r_ctx]
+        nums = grab_all_numbers(ctx)
+        if nums:
+            return nums[0]
+    return None
 
-    # 2) الشكل الدوائي (لو المستخدم محدد form)
-    form_raw=get_form(meta); form_norm=normalize_form(str(form_raw))
-    if strict_form and target_form:
-        if normalize_form(target_form)!=form_norm:
-            if debug: logger.debug(f"SKIP form mismatch: wanted={normalize_form(target_form)} found={form_norm} brand={brand}")
-            return None
+def has_exact_concentration(meta: Dict[str, Any], active_norm: str, target_mg: float) -> Tuple[bool, Optional[float]]:
+    """
+    true لو لقينا رقم يساوي target_mg:
+      - أولًا: رقم ملاصق لاسم المادة المطلوبة (لو أمكن)
+      - وإلا: أي رقم عام في النصوص المجمّعة
+    """
+    if target_mg <= 0:
+        return False, None
+    conc_text = collect_concentration_texts(meta)
+    # حاول رقم ملاصق لاسم المادة
+    near = find_number_near_active(conc_text, active_norm)
+    if near is not None and abs(near - target_mg) < 1e-6:
+        return True, near
+    # وإلا: أي رقم عام يساوي الهدف
+    for n in grab_all_numbers(conc_text):
+        if abs(n - target_mg) < 1e-6:
+            return True, n
+    return False, near
 
-    # 3) المادة الفعّالة (فَزّي)
-    ok_active, active_score, src = has_active_fuzzy(meta, active_query, doc)
-    if not ok_active:
-        if debug: logger.debug(f"SKIP no active hit (score={active_score:.2f}): active='{active_query}' brand={brand}")
-        return None
-
-    # 4) التراكيز
-    strengths=extract_strengths(meta)
-    if not strengths:
-        if debug:
-            cf = get_first_str(meta,("concentrations","التراكيز")) or "غير متوفر"
-            logger.debug(f"SKIP no concentrations parsed: brand={brand} conc_field='{cf[:80]}'")
-        return None
-
-    # اختار السطر اللي أكثر شبهًا لاسم المادة المطلوبة
-    aqn = normalize_ar(active_query)
-    hit=None; best=0.0
-    for c in strengths:
-        sc = token_fuzzy_max(aqn, c["drug"])
-        if sc>best: best=sc; hit=c
-    if not hit: hit=strengths[0]
-
-    # 5) مقارنة الجرعة
-    if hit["per_ml"] is not None:
-        # شراب/محلول (mg/ml)
-        if not allow_per_ml:
-            if debug: logger.debug(f"SKIP per-ml not allowed: brand={brand}")
-            return None
-        # لو المستخدم محدد form مش شراب وstrict=True، ارفض
-        if strict_form and target_form and normalize_form(target_form)!="شراب":
-            if debug: logger.debug(f"SKIP per-ml strict reject: brand={brand}")
-            return None
-        mg_match=True
-    else:
-        mg=float(hit["mg"])
-        mg_match = abs(mg - float(target_mg)) <= float(tolerance_mg)
-        if not mg_match and debug:
-            logger.debug(f"SKIP mg mismatch: target={target_mg}±{tolerance_mg} got={mg} brand={brand}")
-    if not mg_match: return None
-
-    return {
-        "match":{
-            "active_match_score": round(active_score,3),
-            "active": hit["drug"],
-            "mg": float(hit["mg"]),
-            "per_ml": hit["per_ml"],
-            "form": form_norm,
-            "strength_hit": f"{hit['mg']} mg" if hit["per_ml"] is None else f"{hit['mg']} mg per ml={hit['per_ml']:.2f}",
-        }
-    }
-
+# ======================= EquivalentsFinder =======================
 class EquivalentsFinder:
+    """
+    - الاسترجاع: Active/Scientific أولًا → Scientific-only → Brand
+    - الفرز النهائي: exact concentration match أولًا، ثم final_score
+    """
+
     def __init__(
         self,
         collection_name: str = Config.COLLECTION_NAME,
         db_dir: str = Config.DB_DIRECTORY,
         top_k: int = DEFAULT_EQ_TOP_K,
-        min_base10: float = DEFAULT_EQ_MIN_BASE10,
+        min_base10: float = DEFAULT_MIN_BASE10,
     ) -> None:
-        self.collection_name=collection_name
-        self.db_dir=db_dir
-        self.top_k=top_k
-        self.min_base10=min_base10
+        self.collection_name = collection_name
+        self.db_dir = db_dir
+        self.top_k = top_k
+        self.min_base10 = min_base10
 
         self.client = chromadb.PersistentClient(
             path=db_dir,
-            settings=Settings(persist_directory=db_dir, anonymized_telemetry=False, allow_reset=True, is_persistent=True)
+            settings=Settings(
+                persist_directory=db_dir,
+                anonymized_telemetry=False,
+                allow_reset=True,
+                is_persistent=True,
+            )
         )
         self.collection = self.client.get_collection(collection_name)
 
@@ -275,130 +246,189 @@ class EquivalentsFinder:
             encode_kwargs=Config.EMBEDDING_SETTINGS['encode_kwargs'],
         )
 
-    def _query_embed(self, text: str):
-        return self.emb.embed_query(f"query: {text}")
-
-    def _query(self, qemb, n_results: int):
+    # ---------- Queries بالترتيب ----------
+    def _query_active_first(self, q: str) -> Dict[str, Any]:
+        q_emb = self.emb.embed_query(f"active ingredients or scientific: {q}")
         return self.collection.query(
-            query_embeddings=[qemb],
-            n_results=n_results,
-            include=["distances","metadatas","documents"],
+            query_embeddings=[q_emb],
+            n_results=self.top_k,
+            include=["distances", "metadatas", "documents"],
         )
 
-    def _rank_and_filter(self, ids, dists, metas, docs, active_query, target_mg, tolerance_mg, allow_per_ml, target_form, strict_form, limit, debug):
-        rows=[]; dropped={"base10":0,"not_drug":0,"no_active":0,"no_conc":0,"mg_mismatch":0,"form":0,"perml_reject":0}
-        for _id, dist, meta, doc in zip(ids, dists, metas, docs):
-            base=distance_to_score10(dist)
-            if base < self.min_base10:
-                dropped["base10"]+=1; continue
+    def _query_scientific_only(self, q: str) -> Dict[str, Any]:
+        q_emb = self.emb.embed_query(f"scientific name: {q}")
+        return self.collection.query(
+            query_embeddings=[q_emb],
+            n_results=self.top_k,
+            include=["distances", "metadatas", "documents"],
+        )
 
-            brand=get_brand(meta)
+    def _query_brand(self, q: str) -> Dict[str, Any]:
+        q_emb = self.emb.embed_query(f"brand or commercial name: {q}")
+        return self.collection.query(
+            query_embeddings=[q_emb],
+            n_results=self.top_k,
+            include=["distances", "metadatas", "documents"],
+        )
 
-            ok = is_equivalent_item(
-                meta=meta, active_query=active_query, target_mg=float(target_mg),
-                tolerance_mg=float(tolerance_mg), allow_per_ml=allow_per_ml,
-                target_form=target_form, strict_form=strict_form, debug=debug, doc=doc
-            )
-            if not ok:
-                # تخمين سبب الإسقاط (تقريبي)
-                if not is_probably_drug(meta):
-                    dropped["not_drug"]+=1
-                else:
-                    # active؟
-                    hit, score, _ = has_active_fuzzy(meta, active_query, doc)
-                    if not hit: dropped["no_active"]+=1
-                    else:
-                        strengths=extract_strengths(meta)
-                        if not strengths: dropped["no_conc"]+=1
-                        else:
-                            if strict_form and target_form and normalize_form(target_form)!=normalize_form(get_form(meta) or ""):
-                                dropped["form"]+=1
-                            else:
-                                any_perml = any(s["per_ml"] is not None for s in strengths)
-                                if any_perml and (strict_form and target_form and normalize_form(target_form)!="شراب"):
-                                    dropped["perml_reject"]+=1
-                                else:
-                                    dropped["mg_mismatch"]+=1
+    # ---------- المجرى الرئيسي ----------
+    def find_equivalents(
+        self,
+        active_query: str,
+        target_mg: float,
+        tolerance_mg: float = 0.0,   # موجود للتوافق فقط
+        allow_per_ml: bool = True,   # موجود للتوافق فقط
+        target_form: Optional[str] = None,
+        strict_form: bool = True,
+        limit: int = 50,
+        debug: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        - يسترجع مرشحين من 3 استعلامات مرتّبة (active → scientific → brand)
+        - يبني تجميعة موحّدة للمرشحين (أفضل مسافة base لكل id)
+        - يحسب bonus (active/scientific/brand + form)
+        - يفرز أخيرًا كالتالي:
+            (1) exact concentration match = True أولًا
+            (2) ثم final_score أعلى
+            (3) tie-break: base_score10 أعلى
+        """
+        if not active_query:
+            return []
+
+        # 1) اجمع مرشحين من الاستعلامات بالترتيب
+        q_active = self._query_active_first(active_query)
+        q_science = self._query_scientific_only(active_query)
+        q_brand = self._query_brand(active_query)
+
+        pools = [q_active, q_science, q_brand]
+
+        # 2) دمج المرشحين: اختر "أفضل" (أصغر مسافة ⇒ أعلى base_score10) لكل id
+        merged: Dict[str, Dict[str, Any]] = {}  # id -> {dist, meta, doc}
+        for res in pools:
+            ids   = res.get("ids", [[]])[0]
+            dists = res.get("distances", [[]])[0]
+            metas = res.get("metadatas", [[]])[0]
+            docs  = res.get("documents", [[]])[0]
+            for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
+                    merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+
+        q_norm = normalize_ar(active_query)
+
+        # 3) ابنِ الصفوف مع البونصات (بدون بونص تركيز — هنستخدمه للفرز فقط)
+        rows: List[Dict[str, Any]] = []
+        for _id, pack in merged.items():
+            dist = pack["dist"]
+            meta = pack["meta"]
+            doc  = pack["doc"]
+
+            base_score = distance_to_score10(dist)
+            if base_score < self.min_base10:
                 continue
 
-            sci = get_first_str(meta, ("scientific_name","الاسم العلمي"))
+            tag_parts: List[str] = []
+            bonus = 0.0
+
+            # الشكل الدوائي
+            is_ok, soft_bonus = form_matches(meta, target_form, strict_form)
+            if not is_ok:
+                continue
+            if target_form and soft_bonus:
+                bonus += FORM_MATCH_BONUS if strict_form else FORM_SOFT_BONUS
+                tag_parts.append("form_match")
+
+            # المواد الفعّالة (أعلى من العلمي)
+            a_ratio, a_tok = best_active_fuzzy_ratio(meta, q_norm)
+            if a_ratio >= ACTIVE_FUZZY_MIN:
+                bonus += ACTIVE_BASE_BOOST * a_ratio
+                if a_ratio >= 0.90:
+                    bonus += ACTIVE_STRONG_BOOST
+                    tag_parts.append("active_strong_fuzzy")
+                else:
+                    tag_parts.append(f"active_fuzzy({a_ratio:.2f})")
+            else:
+                tag_parts.append("active_miss")
+
+            # العلمي فقط
+            sci_ratio = fuzzy_ratio_on_scientific_only(meta, q_norm)
+            if sci_ratio >= SCIENTIFIC_FUZZY_MIN:
+                bonus += SCIENTIFIC_BASE_BOOST * sci_ratio
+                if sci_ratio >= 0.90:
+                    bonus += SCIENTIFIC_STRONG_BOOST
+                    tag_parts.append("sci_strong_fuzzy")
+                else:
+                    tag_parts.append(f"sci_fuzzy({sci_ratio:.2f})")
+            else:
+                tag_parts.append("sci_miss")
+
+            # التجاري (أقل وزن)
+            brand = best_brand_field(meta)
+            b_ratio, b_token, b_pen = brand_best_token_ratio(brand, q_norm)
+            if b_ratio >= BRAND_FUZZY_MIN:
+                bonus += BRAND_BASE_BOOST * b_ratio * b_pen
+                if b_ratio >= 0.90 or (b_token and abs(len(b_token) - len(q_norm)) <= 1):
+                    bonus += BRAND_STRONG_BOOST
+                    tag_parts.append("brand_strong_fuzzy")
+                else:
+                    tag_parts.append("brand_fuzzy")
+            else:
+                tag_parts.append("brand_miss")
+
+            # فحص التطابق العددي للتركيز (للفرز فقط)
+            active_norm = q_norm
+            conc_exact, conc_num = has_exact_concentration(meta, active_norm, target_mg)
+
             row = {
                 "id": _id,
-                "query": {
-                    "active": active_query, "mg": float(target_mg),
-                    "form": target_form, "tolerance_mg": float(tolerance_mg),
-                    "strict_form": bool(strict_form), "allow_per_ml": bool(allow_per_ml),
-                },
-                "base_score10": round(base,3),
+                "query": active_query,
+                "base_score10": round(base_score, 3),
+                "final_score": round(base_score + bonus, 3),
+                "bonus": round(bonus, 3),
+                "tag": "+".join(tag_parts) if tag_parts else "vector_only",
                 "brand": brand or None,
-                "name": meta.get("name") or meta.get("اسم الدواء الأصلي"),
-                "commercial_name": meta.get("commercial_name") or meta.get("الاسم التجاري"),
-                "scientific_name": sci or meta.get("الاسم العلمي"),
-                "manufacturer": meta.get("manufacturer") or meta.get("الشركة المصنعة"),
-                "form": get_form(meta),
-                "match": ok["match"],
+                "name": (meta or {}).get("name") or (meta or {}).get("اسم الدواء الأصلي"),
+                "commercial_name": brand or (meta or {}).get("commercial_name") or (meta or {}).get("الاسم التجاري"),
+                "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
+                "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
                 "meta": meta,
                 "doc": doc,
-                "tag": "equivalent"
+                # مفاتيح مساعدة للفرز النهائي:
+                "_conc_exact": bool(conc_exact),
+                "_conc_num": conc_num,
             }
             rows.append(row)
 
-        rows.sort(key=lambda x: (x["match"]["active_match_score"], x["base_score10"]), reverse=True)
-        if limit: rows = rows[:limit]
-        return rows, dropped
+        # 4) الفرز النهائي:
+        #   - أولًا: اللي عندها _conc_exact == True
+        #   - بعدين: final_score أعلى
+        #   - بعدين: base_score10 أعلى
+        rows.sort(key=lambda x: (
+            0 if x.get("_conc_exact") else 1,
+            -(x["final_score"]),
+            -(x["base_score10"])
+        ))
 
-    def find_equivalents(
-        self, active_query: str, target_mg: float,
-        tolerance_mg: float=0.0, allow_per_ml: bool=True,
-        target_form: Optional[str]=None, strict_form: bool=True,
-        limit: int=50, debug: bool=False
-    ) -> List[Dict[str,Any]]:
-        if debug:
-            logger.setLevel(logging.DEBUG)
-            logger.debug(f"REQ active='{active_query}' mg={target_mg} tol={tolerance_mg} form='{target_form}' strict={strict_form} allow_per_ml={allow_per_ml} topk={self.top_k} minbase={self.min_base10}")
+        # تنظيف المفاتيح المساعدة قبل الإرجاع + limit
+        for r in rows:
+            r.pop("_conc_exact", None)
+            r.pop("_conc_num", None)
 
-        # الجولة 1
-        q = self._query_embed(f"active ingredient: {active_query} strength: {target_mg} mg")
-        r = self._query(q, n_results=self.top_k)
-        ids  = r.get("ids",[[]])[0]
-        dists= r.get("distances",[[]])[0]
-        metas= r.get("metadatas",[[]])[0]
-        docs = r.get("documents",[[]])[0]
-        if debug: logger.debug(f"CANDIDATES via vector: {len(ids)}")
+        if limit:
+            rows = rows[:limit]
+        return rows
 
-        rows, dropped = self._rank_and_filter(ids,dists,metas,docs,active_query,target_mg,tolerance_mg,allow_per_ml,target_form,strict_form,limit,debug)
-        if rows:
-            if debug:
-                logger.debug(f"RETURN {len(rows)} hits")
-                logger.debug(f"DROP-STATS: {json.dumps(dropped, ensure_ascii=False)}")
-            return rows
-
-        # Rescue: استعلامات أبسط ونطاق أكبر
-        if debug: logger.debug("RESCUE: expand query variants and n_results")
-        variants = [
-            f"{active_query} {int(target_mg)} mg",
-            f"{active_query}",
-            f"ماده فعاله {active_query}",
-            f"الاسم العلمي {active_query}",
-        ]
-        bag = {}
-        for vt in variants:
-            qv = self._query_embed(vt)
-            rv = self._query(qv, n_results=max(self.top_k, 3000))
-            for i, d, m, doc in zip(rv.get("ids",[[]])[0], rv.get("distances",[[]])[0], rv.get("metadatas",[[]])[0], rv.get("documents",[[]])[0]):
-                if i not in bag or d < bag[i][0]:
-                    bag[i] = (d, m, doc)
-
-        if not bag:
-            if debug: logger.debug("RETURN 0 hits (rescue empty)")
-            return []
-
-        ids2, dists2, metas2, docs2 = [], [], [], []
-        for i,(d,m,doc) in bag.items():
-            ids2.append(i); dists2.append(d); metas2.append(m); docs2.append(doc)
-
-        rows2, dropped2 = self._rank_and_filter(ids2,dists2,metas2,docs2,active_query,target_mg,tolerance_mg,allow_per_ml,target_form,strict_form,limit,debug)
-        if debug:
-            logger.debug(f"RETURN {len(rows2)} hits (after rescue)")
-            logger.debug(f"DROP-STATS: {json.dumps(dropped2, ensure_ascii=False)}")
-        return rows2
+# ====== الشكل الدوائي (نُعيد استخدامها هنا) ======
+def form_matches(meta: Dict[str, Any], target_form: Optional[str], strict_form: bool) -> Tuple[bool, bool]:
+    """يرجع (is_ok, soft_bonus_flag)"""
+    if not target_form:
+        return True, False
+    mform = (meta or {}).get("pharma_form") or (meta or {}).get("الشكل الدوائي") or ""
+    if not isinstance(mform, str):
+        mform = str(mform or "")
+    nf = normalize_ar(target_form)
+    mf = normalize_ar(mform)
+    if not nf:
+        return True, False
+    if mf == nf or nf in mf or mf in nf:
+        return True, True
+    return (False, False) if strict_form else (True, True)
