@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 import unicodedata
 import difflib
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 import chromadb
 from chromadb.config import Settings
@@ -56,10 +56,17 @@ DEFAULT_MIN_BASE10      = 0.0
 # عتبة اعتبار النتيجة "مرتبطة علميًا"
 RELEVANT_MIN            = 0.70
 
+# ======================= بدائل (Different Actives) =======================
+# أوزان بدائل تعتمد على تطابق الأمراض/الأعراض والتصنيف/القسم
+ALT_DISEASE_OVERLAP_BOOST = 3.0
+ALT_CLASS_MATCH_BONUS     = 0.8
+ALT_SECTION_MATCH_BONUS   = 0.6
+
 # ======================= تطبيع وأدوات عامة =======================
 _ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06ED]")
 AR_CHARS = "ء-ي"
 _NON_WORD = re.compile(rf"[^\w{AR_CHARS}]+", re.UNICODE)
+_LIST_SEP = re.compile(r"[،,;؛]\s*")
 
 def normalize_ar(text: str) -> str:
     if not isinstance(text, str):
@@ -133,6 +140,32 @@ def best_brand_field(meta: Dict[str, Any]) -> str:
         if isinstance(val, str) and val.strip():
             return val
     return ""
+
+# ======================= أمراض/أعراض/تصنيف/قسم =======================
+def _split_list_phrases(text: str) -> List[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    # نفصل بالقواطع الشائعة مع الحفاظ على العبارات
+    parts = [p.strip() for p in _LIST_SEP.split(text) if p and p.strip()]
+    # صيانة العبارات القصيرة جدًا
+    return [p for p in parts if len(normalize_ar(p)) >= 2]
+
+def extract_diseases_phrases(meta: Dict[str, Any]) -> List[str]:
+    v = (meta or {}).get("diseases") or (meta or {}).get("الأمراض التي يعالجها") or ""
+    return _split_list_phrases(v)
+
+def extract_symptoms_phrases(meta: Dict[str, Any]) -> List[str]:
+    v = (meta or {}).get("disease_symptoms") or (meta or {}).get("أعراض المرض") or ""
+    return _split_list_phrases(v)
+
+def normalize_set(items: List[str]) -> Set[str]:
+    return {normalize_ar(x) for x in items if isinstance(x, str) and x.strip()}
+
+def get_classification(meta: Dict[str, Any]) -> str:
+    return (meta or {}).get("classification") or (meta or {}).get("التصنيف الدوائي") or ""
+
+def get_section(meta: Dict[str, Any]) -> str:
+    return (meta or {}).get("section") or (meta or {}).get("القسم") or ""
 
 def brand_best_token_ratio(brand: str, q_norm: str) -> Tuple[float, str, float]:
     """فزي على مستوى توكن من الاسم التجاري + عقوبة طول خفيفة."""
@@ -269,6 +302,25 @@ class EquivalentsFinder:
 
     def _query_brand(self, q: str) -> Dict[str, Any]:
         q_emb = self.emb.embed_query(f"brand or commercial name: {q}")
+        return self.collection.query(
+            query_embeddings=[q_emb],
+            n_results=self.top_k,
+            include=["distances", "metadatas", "documents"],
+        )
+
+    def _query_by_profile(self, diseases_text: str, symptoms_text: str, classification: str, section: str) -> Dict[str, Any]:
+        # نجمع بروفايل علاجي مختصر للاستعلام
+        profile_parts: List[str] = []
+        if diseases_text:
+            profile_parts.append(f"treats diseases: {diseases_text}")
+        if symptoms_text:
+            profile_parts.append(f"symptoms: {symptoms_text}")
+        if classification:
+            profile_parts.append(f"classification: {classification}")
+        if section:
+            profile_parts.append(f"section: {section}")
+        profile_query = " | ".join(profile_parts) if profile_parts else ""
+        q_emb = self.emb.embed_query(profile_query)
         return self.collection.query(
             query_embeddings=[q_emb],
             n_results=self.top_k,
@@ -427,6 +479,171 @@ class EquivalentsFinder:
             r.pop("_conc_exact", None)
             r.pop("_conc_num", None)
 
+        if limit:
+            rows = rows[:limit]
+        return rows
+
+    # ---------- بدائل بمادة مختلفة لكن نفس الاستخدامات ----------
+    def _collect_seed_context(
+        self,
+        active_query: str,
+        target_form: Optional[str],
+        strict_form: bool,
+        seed_limit: int = 20,
+    ) -> Tuple[Set[str], Set[str], str, str]:
+        """يجمع سياق علاجي (أمراض/أعراض/تصنيف/قسم) من أفضل نتائج المثائل كبذور."""
+        seeds = self.find_equivalents(
+            active_query=active_query,
+            target_mg=0.0,
+            tolerance_mg=0.0,
+            allow_per_ml=True,
+            target_form=target_form,
+            strict_form=strict_form,
+            limit=seed_limit,
+            debug=False,
+        )
+        diseases_union: Set[str] = set()
+        symptoms_union: Set[str] = set()
+        class_counts: Dict[str, int] = {}
+        section_counts: Dict[str, int] = {}
+        for r in seeds:
+            meta = r.get("meta") or {}
+            d = normalize_set(extract_diseases_phrases(meta))
+            s = normalize_set(extract_symptoms_phrases(meta))
+            diseases_union.update(d)
+            symptoms_union.update(s)
+            cl = normalize_ar(get_classification(meta))
+            sec = normalize_ar(get_section(meta))
+            if cl:
+                class_counts[cl] = class_counts.get(cl, 0) + 1
+            if sec:
+                section_counts[sec] = section_counts.get(sec, 0) + 1
+
+        def pick_max(counts: Dict[str, int]) -> str:
+            if not counts:
+                return ""
+            return max(counts.items(), key=lambda kv: kv[1])[0]
+
+        return diseases_union, symptoms_union, pick_max(class_counts), pick_max(section_counts)
+
+    def find_alternatives(
+        self,
+        active_query: str,
+        target_form: Optional[str] = None,
+        strict_form: bool = True,
+        limit: int = 50,
+        exclude_ids: Optional[Set[str]] = None,
+        debug: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        يعثر على بدائل بمادة فعالة مختلفة لكنها تعالج نفس الأمراض/الأعراض أو تقع تحت نفس التصنيف/القسم.
+        - يستخدم سياقًا مستمدًا من نتائج المثائل كبذرة للاستعلام.
+        - يستبعد أي نتيجة تحتوي نفس المادة الفعالة المطلوب بديلها.
+        """
+        if not active_query:
+            return []
+
+        active_norm = normalize_ar(active_query)
+        diseases_set, symptoms_set, seed_class, seed_section = self._collect_seed_context(
+            active_query, target_form, strict_form, seed_limit=min(20, self.top_k)
+        )
+
+        # لا يوجد سياق كافٍ
+        if not diseases_set and not symptoms_set and not seed_class and not seed_section:
+            return []
+
+        diseases_text = "، ".join(sorted(diseases_set))
+        symptoms_text = "، ".join(sorted(symptoms_set))
+        res = self._query_by_profile(diseases_text, symptoms_text, seed_class, seed_section)
+
+        ids   = res.get("ids", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        docs  = res.get("documents", [[]])[0]
+
+        seeds_union = diseases_set.union(symptoms_set)
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+            if not _id or _id in seen:
+                continue
+            seen.add(_id)
+            if exclude_ids and _id in exclude_ids:
+                continue
+
+            base_score = distance_to_score10(dist)
+            if base_score < self.min_base10:
+                continue
+
+            # الشكل الدوائي
+            is_ok, soft_bonus = form_matches(meta, target_form, strict_form)
+            if not is_ok:
+                continue
+
+            # استبعاد نفس المادة الفعالة
+            ai = normalize_ar((meta or {}).get("active_ingredients") or (meta or {}).get("المواد الفعالة") or "")
+            sci = normalize_ar((meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي") or "")
+            if active_norm and (active_norm in ai or active_norm in sci):
+                continue
+
+            brand = best_brand_field(meta)
+
+            cand_d = normalize_set(extract_diseases_phrases(meta))
+            cand_s = normalize_set(extract_symptoms_phrases(meta))
+            cand_union = cand_d.union(cand_s)
+
+            overlap = 0.0
+            if seeds_union:
+                inter = seeds_union.intersection(cand_union)
+                overlap = len(inter) / max(1, len(seeds_union))
+
+            bonus = 0.0
+            tag_parts: List[str] = []
+            if soft_bonus and target_form:
+                bonus += FORM_MATCH_BONUS if strict_form else FORM_SOFT_BONUS
+                tag_parts.append("form_match")
+
+            if overlap > 0:
+                bonus += ALT_DISEASE_OVERLAP_BOOST * overlap
+                tag_parts.append(f"alt_overlap({overlap:.2f})")
+            else:
+                tag_parts.append("alt_overlap(0)")
+
+            cand_class = normalize_ar(get_classification(meta))
+            cand_section = normalize_ar(get_section(meta))
+            if seed_class and cand_class and (seed_class == cand_class or seed_class in cand_class or cand_class in seed_class):
+                bonus += ALT_CLASS_MATCH_BONUS
+                tag_parts.append("class_match")
+            if seed_section and cand_section and (seed_section == cand_section or seed_section in cand_section or cand_section in seed_section):
+                bonus += ALT_SECTION_MATCH_BONUS
+                tag_parts.append("section_match")
+
+            row = {
+                "id": _id,
+                "query": active_query,
+                "base_score10": round(base_score, 3),
+                "final_score": round(base_score + bonus, 3),
+                "bonus": round(bonus, 3),
+                "tag": "+".join(tag_parts) if tag_parts else "vector_only",
+                "brand": brand or None,
+                "name": (meta or {}).get("name") or (meta or {}).get("اسم الدواء الأصلي"),
+                "commercial_name": brand or (meta or {}).get("commercial_name") or (meta or {}).get("الاسم التجاري"),
+                "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
+                "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
+                "meta": meta,
+                "doc": doc,
+                # مفاتيح مساعدة للفرز
+                "_overlap": overlap,
+                "_base": base_score,
+            }
+            rows.append(row)
+
+        # الفرز: أعلى تداخل ثم final_score ثم base
+        rows.sort(key=lambda x: (-(x.get("_overlap", 0.0)), -(x["final_score"]), -(x.get("_base", 0.0))))
+        for r in rows:
+            r.pop("_overlap", None)
+            r.pop("_base", None)
         if limit:
             rows = rows[:limit]
         return rows

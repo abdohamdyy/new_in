@@ -136,7 +136,7 @@ def equivalents_get():
         if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
             local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
 
-        results = local_finder.find_equivalents(
+        eq_results = local_finder.find_equivalents(
             active_query=active.strip(),
             target_mg=mg_val,
             tolerance_mg=tol,
@@ -146,9 +146,21 @@ def equivalents_get():
             limit=limit,
             debug=debug_flag,
         )
-        logger.info(f"/equivalents -> {len(results)} results")
+        exclude_ids = {str(r.get('id')) for r in eq_results}
+        alt_results = local_finder.find_alternatives(
+            active_query=active.strip(),
+            target_form=form,
+            strict_form=strict_form,
+            limit=limit,
+            exclude_ids=exclude_ids,
+            debug=debug_flag,
+        )
+        logger.info(f"/equivalents -> equivalents={len(eq_results)} alternatives={len(alt_results)}")
         return app.response_class(
-            response=json.dumps(results, ensure_ascii=False),
+            response=json.dumps({
+                "equivalents": eq_results,
+                "alternatives": alt_results,
+            }, ensure_ascii=False),
             status=200,
             mimetype="application/json; charset=utf-8",
         )
@@ -205,7 +217,7 @@ def equivalents_post():
         if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
             local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
 
-        results = local_finder.find_equivalents(
+        eq_results = local_finder.find_equivalents(
             active_query=active,
             target_mg=mg_val,
             tolerance_mg=tol,
@@ -215,9 +227,21 @@ def equivalents_post():
             limit=limit,
             debug=debug_flag,
         )
-        logger.info(f"/equivalents -> {len(results)} results")
+        exclude_ids = {str(r.get('id')) for r in eq_results}
+        alt_results = local_finder.find_alternatives(
+            active_query=active,
+            target_form=form,
+            strict_form=strict_form,
+            limit=limit,
+            exclude_ids=exclude_ids,
+            debug=debug_flag,
+        )
+        logger.info(f"/equivalents -> equivalents={len(eq_results)} alternatives={len(alt_results)}")
         return app.response_class(
-            response=json.dumps(results, ensure_ascii=False),
+            response=json.dumps({
+                "equivalents": eq_results,
+                "alternatives": alt_results,
+            }, ensure_ascii=False),
             status=200,
             mimetype="application/json; charset=utf-8",
         )
