@@ -338,6 +338,57 @@ def parse_concentrations_from_meta(meta: Dict[str, Any]) -> List[Dict[str, float
             return [{nm: v}]
     return []
 
+# ======================= أدوات متعددة المواد =======================
+def normalize_actives_input(actives: Any) -> List[Tuple[str, float]]:
+    """
+    يحوّل قائمة المواد المطلوبة (بصيغ مرنة) إلى قائمة [(name_norm, mg)].
+    - يقبل شكل [{"باراسيتامول": 500}, {"سودوإيفيدرين": 30}, ...] أو [["باراسيتامول", 500], ...]
+    - يزيل التكرارات حسب الاسم الموحّد.
+    """
+    out: List[Tuple[str, float]] = []
+    try:
+        if not isinstance(actives, list):
+            return out
+        for item in actives:
+            if isinstance(item, dict) and len(item) == 1:
+                [(k, v)] = list(item.items())
+                name_norm = normalize_ar(_clean_material_name(str(k)))
+                try:
+                    mg_val = float(v)
+                except Exception:
+                    mg_val = 0.0
+                if name_norm:
+                    out.append((name_norm, mg_val))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                name_norm = normalize_ar(_clean_material_name(str(item[0])))
+                try:
+                    mg_val = float(item[1])
+                except Exception:
+                    mg_val = 0.0
+                if name_norm:
+                    out.append((name_norm, mg_val))
+    except Exception:
+        return out
+    # إزالة التكرارات بنفس الاسم الموحّد
+    seen: Set[str] = set()
+    uniq: List[Tuple[str, float]] = []
+    for nm, mg in out:
+        if nm and nm not in seen:
+            seen.add(nm)
+            uniq.append((nm, mg))
+    return uniq
+
+def brand_best_multi_ratio(brand: str, q_norm_list: List[str]) -> Tuple[float, str, float]:
+    """أفضل تطابق للماركة عبر عدة توكنات استعلام (أسماء مواد متعددة)."""
+    best_ratio = 0.0
+    best_tok = ""
+    best_pen = 1.0
+    for qn in q_norm_list:
+        r, t, p = brand_best_token_ratio(brand, qn)
+        if r * p > best_ratio * best_pen:
+            best_ratio, best_tok, best_pen = r, t, p
+    return best_ratio, best_tok, best_pen
+
 # ======================= EquivalentsFinder =======================
 class EquivalentsFinder:
     """
@@ -751,6 +802,338 @@ class EquivalentsFinder:
             rows.append(row)
 
         # الفرز: أعلى تداخل ثم final_score ثم base
+        rows.sort(key=lambda x: (-(x.get("_overlap", 0.0)), -(x["final_score"]), -(x.get("_base", 0.0))))
+        for r in rows:
+            r.pop("_overlap", None)
+            r.pop("_base", None)
+        if limit:
+            rows = rows[:limit]
+        return rows
+
+    def find_equivalents_multi(
+        self,
+        actives: List[Any],
+        target_form: Optional[str] = None,
+        strict_form: bool = True,
+        limit: int = 50,
+        debug: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        بحث مثائل لمجموعة مواد فعّالة مع تراكيزها.
+        - يقدّم النتائج التي تحتوي كل المواد أولًا، ثم التي تحتوي اثنتين، ثم واحدة.
+        - داخل كل مجموعة: يفضّل من يطابق التراكيز المقصودة، ثم final_score.
+        actives: قائمة مثل [{"باراسيتامول": 500}, {"سودوإيفيدرين": 30}, {"دكستروميثورفان": 15}]
+        """
+        pairs = normalize_actives_input(actives)
+        if not pairs:
+            return []
+
+        # 1) اجمع مرشحين من استعلامات لكل مادة
+        q_norm_list = [nm for (nm, _mg) in pairs]
+        merged: Dict[str, Dict[str, Any]] = {}
+        for qn in q_norm_list:
+            for res in (self._query_active_first(qn), self._query_scientific_only(qn), self._query_brand(qn)):
+                ids   = res.get("ids", [[]])[0]
+                dists = res.get("distances", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+                docs  = res.get("documents", [[]])[0]
+                for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                    if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
+                        merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+
+        # 2) ابنِ الصفوف مع حساب المطابقات عبر كل المواد
+        rows: List[Dict[str, Any]] = []
+        for _id, pack in merged.items():
+            dist = pack["dist"]
+            meta = pack["meta"]
+            doc  = pack["doc"]
+
+            base_score = distance_to_score10(dist)
+            if base_score < self.min_base10:
+                continue
+
+            # الشكل الدوائي
+            is_ok, soft_bonus = form_matches(meta, target_form, strict_form)
+            if not is_ok:
+                continue
+
+            bonus = 0.0
+            tag_parts: List[str] = []
+            if target_form and soft_bonus:
+                bonus += FORM_MATCH_BONUS if strict_form else FORM_SOFT_BONUS
+                tag_parts.append("form_match")
+
+            matched_count = 0
+            exact_conc_count = 0
+            per_active_matches: List[Dict[str, Any]] = []
+
+            for (act_norm, mg) in pairs:
+                a_ratio, a_tok = best_active_fuzzy_ratio(meta, act_norm)
+                sci_ratio = fuzzy_ratio_on_scientific_only(meta, act_norm)
+                relevant = (a_ratio >= RELEVANT_MIN) or (sci_ratio >= RELEVANT_MIN)
+
+                conc_exact = False
+                conc_num: Optional[float] = None
+                if relevant and mg and mg > 0:
+                    conc_exact, conc_num = has_exact_concentration(meta, act_norm, mg)
+
+                if relevant:
+                    matched_count += 1
+                    if conc_exact:
+                        exact_conc_count += 1
+
+                # بونصات المادة الواحدة
+                if a_ratio >= ACTIVE_FUZZY_MIN:
+                    bonus += ACTIVE_BASE_BOOST * a_ratio
+                    if a_ratio >= 0.90:
+                        bonus += ACTIVE_STRONG_BOOST
+                if sci_ratio >= SCIENTIFIC_FUZZY_MIN:
+                    bonus += SCIENTIFIC_BASE_BOOST * sci_ratio
+                    if sci_ratio >= 0.90:
+                        bonus += SCIENTIFIC_STRONG_BOOST
+
+                per_active_matches.append({
+                    "active": act_norm,
+                    "mg": mg,
+                    "active_ratio": round(a_ratio, 3),
+                    "scientific_ratio": round(sci_ratio, 3),
+                    "relevant": relevant,
+                    "conc_exact": bool(conc_exact),
+                    "conc_num": conc_num,
+                })
+
+            # بونص التجاري (مرة واحدة بأفضل تطابق عبر المواد)
+            brand = best_brand_field(meta)
+            b_ratio, b_token, b_pen = brand_best_multi_ratio(brand, q_norm_list)
+            if b_ratio >= BRAND_FUZZY_MIN:
+                bonus += BRAND_BASE_BOOST * b_ratio * b_pen
+                if b_ratio >= 0.90 or (b_token and abs(len(b_token) - max(len(q) for q in q_norm_list)) <= 1):
+                    bonus += BRAND_STRONG_BOOST
+                    tag_parts.append("brand_strong_fuzzy")
+                else:
+                    tag_parts.append("brand_fuzzy")
+            else:
+                tag_parts.append("brand_miss")
+
+            # تحويل التراكيز إن أمكن
+            meta_out = dict(meta or {})
+            try:
+                parsed_conc = parse_concentrations_from_meta(meta_out)
+                if parsed_conc:
+                    meta_out["concentrations_raw"] = meta_out.get("concentrations")
+                    meta_out["concentrations"] = parsed_conc
+            except Exception:
+                pass
+
+            joined_query = " + ".join([nm for (nm, _m) in pairs])
+            row = {
+                "id": _id,
+                "query": joined_query,
+                "base_score10": round(base_score, 3),
+                "final_score": round(base_score + bonus, 3),
+                "bonus": round(bonus, 3),
+                "tag": "+".join(tag_parts) if tag_parts else "vector_only",
+                "brand": brand or None,
+                "name": (meta or {}).get("name") or (meta or {}).get("اسم الدواء الأصلي"),
+                "commercial_name": brand or (meta or {}).get("commercial_name") or (meta or {}).get("الاسم التجاري"),
+                "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
+                "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
+                "meta": meta_out,
+                "doc": doc,
+                # مفاتيح مساعدة للفرز
+                "_matched_count": matched_count,
+                "_exact_conc_count": exact_conc_count,
+                "_actives_total": len(pairs),
+                # معلومات تفصيلية اختيارية
+                "matches": per_active_matches,
+            }
+            # استبعد من ليس لديه أي تطابق ذي صلة
+            if matched_count <= 0:
+                continue
+            rows.append(row)
+
+        # 3) الفرز النهائي: عدد المطابقات ثم عدد تراكيز مطابقة ثم final_score ثم base
+        rows.sort(key=lambda x: (
+            -x.get("_matched_count", 0),
+            -x.get("_exact_conc_count", 0),
+            -(x["final_score"]),
+            -(x["base_score10"]) 
+        ))
+
+        # تنظيف المفاتيح المساعدة + limit
+        for r in rows:
+            r.pop("_matched_count", None)
+            r.pop("_exact_conc_count", None)
+            r.pop("_actives_total", None)
+        if limit:
+            rows = rows[:limit]
+        return rows
+
+    def _collect_seed_context_multi(
+        self,
+        actives: List[Any],
+        target_form: Optional[str],
+        strict_form: bool,
+        seed_limit: int = 20,
+    ) -> Tuple[Set[str], Set[str], str, str]:
+        """يجمع سياق علاجي كبذور اعتمادًا على نتائج multi-equivalents."""
+        seeds = self.find_equivalents_multi(
+            actives=actives,
+            target_form=target_form,
+            strict_form=strict_form,
+            limit=seed_limit,
+            debug=False,
+        )
+        diseases_union: Set[str] = set()
+        symptoms_union: Set[str] = set()
+        class_counts: Dict[str, int] = {}
+        section_counts: Dict[str, int] = {}
+        for r in seeds:
+            meta = r.get("meta") or {}
+            d = normalize_set(extract_diseases_phrases(meta))
+            s = normalize_set(extract_symptoms_phrases(meta))
+            diseases_union.update(d)
+            symptoms_union.update(s)
+            cl = normalize_ar(get_classification(meta))
+            sec = normalize_ar(get_section(meta))
+            if cl:
+                class_counts[cl] = class_counts.get(cl, 0) + 1
+            if sec:
+                section_counts[sec] = section_counts.get(sec, 0) + 1
+
+        def pick_max(counts: Dict[str, int]) -> str:
+            if not counts:
+                return ""
+            return max(counts.items(), key=lambda kv: kv[1])[0]
+
+        return diseases_union, symptoms_union, pick_max(class_counts), pick_max(section_counts)
+
+    def find_alternatives_multi(
+        self,
+        actives: List[Any],
+        target_form: Optional[str] = None,
+        strict_form: bool = True,
+        limit: int = 50,
+        exclude_ids: Optional[Set[str]] = None,
+        debug: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        بدائل لمجموعة مواد مختلفة لكن تعالج نفس الأمراض/الأعراض.
+        - يُستبعد من لديه بالضبط نفس كل المواد المطلوبة.
+        - لو كان الدواء المرشح ذو مادة واحدة وتطابق إحدى المواد الأصلية، يُستبعد.
+        """
+        pairs = normalize_actives_input(actives)
+        if not pairs:
+            return []
+
+        orig_set: Set[str] = {nm for (nm, _mg) in pairs}
+        diseases_set, symptoms_set, seed_class, seed_section = self._collect_seed_context_multi(
+            actives, target_form, strict_form, seed_limit=min(20, self.top_k)
+        )
+
+        if not diseases_set and not symptoms_set and not seed_class and not seed_section:
+            return []
+
+        diseases_text = "، ".join(sorted(diseases_set))
+        symptoms_text = "، ".join(sorted(symptoms_set))
+        res = self._query_by_profile(diseases_text, symptoms_text, seed_class, seed_section)
+
+        ids   = res.get("ids", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        docs  = res.get("documents", [[]])[0]
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+            if not _id or _id in seen:
+                continue
+            seen.add(_id)
+            if exclude_ids and _id in exclude_ids:
+                continue
+
+            base_score = distance_to_score10(dist)
+            if base_score < self.min_base10:
+                continue
+
+            # الشكل الدوائي
+            is_ok, soft_bonus = form_matches(meta, target_form, strict_form)
+            if not is_ok:
+                continue
+
+            # تجميع توكنات المواد للمرشح
+            cand_tokens = set(extract_active_tokens(meta))
+
+            # استبعاد من يطابق كل المواد الأصلية (نفس التركيبة)
+            if orig_set and orig_set.issubset(cand_tokens):
+                continue
+
+            # لو المرشح ذو مادة واحدة وهي إحدى المواد الأصلية → استبعد
+            if len(cand_tokens) == 1 and any(t in orig_set for t in cand_tokens):
+                continue
+
+            brand = best_brand_field(meta)
+
+            cand_d = normalize_set(extract_diseases_phrases(meta))
+            cand_s = normalize_set(extract_symptoms_phrases(meta))
+            cand_union = cand_d.union(cand_s)
+
+            seeds_union = diseases_set.union(symptoms_set)
+            overlap = 0.0
+            if seeds_union:
+                inter = seeds_union.intersection(cand_union)
+                overlap = len(inter) / max(1, len(seeds_union))
+
+            bonus = 0.0
+            tag_parts: List[str] = []
+            if soft_bonus and target_form:
+                bonus += FORM_MATCH_BONUS if strict_form else FORM_SOFT_BONUS
+                tag_parts.append("form_match")
+            if overlap > 0:
+                bonus += ALT_DISEASE_OVERLAP_BOOST * overlap
+                tag_parts.append(f"alt_overlap({overlap:.2f})")
+            else:
+                tag_parts.append("alt_overlap(0)")
+
+            cand_class = normalize_ar(get_classification(meta))
+            cand_section = normalize_ar(get_section(meta))
+            if seed_class and cand_class and (seed_class == cand_class or seed_class in cand_class or cand_class in seed_class):
+                bonus += ALT_CLASS_MATCH_BONUS
+                tag_parts.append("class_match")
+            if seed_section and cand_section and (seed_section == cand_section or seed_section in cand_section or cand_section in seed_section):
+                bonus += ALT_SECTION_MATCH_BONUS
+                tag_parts.append("section_match")
+
+            # تحويل التراكيز إن أمكن
+            meta_out = dict(meta or {})
+            try:
+                parsed_conc = parse_concentrations_from_meta(meta_out)
+                if parsed_conc:
+                    meta_out["concentrations_raw"] = meta_out.get("concentrations")
+                    meta_out["concentrations"] = parsed_conc
+            except Exception:
+                pass
+
+            row = {
+                "id": _id,
+                "query": " + ".join(sorted(list(orig_set))),
+                "base_score10": round(base_score, 3),
+                "final_score": round(base_score + bonus, 3),
+                "bonus": round(bonus, 3),
+                "tag": "+".join(tag_parts) if tag_parts else "vector_only",
+                "brand": brand or None,
+                "name": (meta or {}).get("name") or (meta or {}).get("اسم الدواء الأصلي"),
+                "commercial_name": brand or (meta or {}).get("commercial_name") or (meta or {}).get("الاسم التجاري"),
+                "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
+                "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
+                "meta": meta_out,
+                "doc": doc,
+                # مفاتيح مساعدة للفرز
+                "_overlap": overlap,
+                "_base": base_score,
+            }
+            rows.append(row)
+
         rows.sort(key=lambda x: (-(x.get("_overlap", 0.0)), -(x["final_score"]), -(x.get("_base", 0.0))))
         for r in rows:
             r.pop("_overlap", None)

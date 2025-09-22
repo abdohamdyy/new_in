@@ -109,14 +109,26 @@ def equivalents_get():
     - form: اختياري (أقراص/كبسول/شراب/أمبول/...)
     - debug: اختياري (لو true يطلع لوجز تفصيلية في docker logs)
     """
+    # دعم إدخال متعدد المواد عبر actives (JSON list). لو غير متاح نرجع للنمط القديم active+mg
+    actives_raw = request.args.get("actives", type=str)
     active = request.args.get("active", type=str)
     mg = request.args.get("mg", type=str)
-    if not active or not active.strip():
-        return jsonify({"error": "missing 'active' parameter"}), 400
-    try:
-        mg_val = float(str(mg).strip())
-    except Exception:
-        return jsonify({"error": "invalid 'mg' parameter, must be a number (mg)"}), 400
+    actives_list = None
+    if actives_raw:
+        try:
+            actives_list = json.loads(actives_raw)
+            if not isinstance(actives_list, list) or not actives_list:
+                actives_list = None
+        except Exception:
+            actives_list = None
+    mg_val = None
+    if not actives_list:
+        if not active or not active.strip():
+            return jsonify({"error": "missing 'active' parameter or provide 'actives' list"}), 400
+        try:
+            mg_val = float(str(mg).strip())
+        except Exception:
+            return jsonify({"error": "invalid 'mg' parameter, must be a number (mg)"}), 400
 
     form = request.args.get("form", type=str)
     tol = request.args.get("tol", type=float) or 0.0
@@ -130,31 +142,52 @@ def equivalents_get():
     try:
         if debug_flag:
             logger.setLevel(logging.DEBUG)
-        logger.info(f"/equivalents GET active='{active}' mg={mg_val} form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
+        if actives_list:
+            logger.info(f"/equivalents GET actives(list) form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
+        else:
+            logger.info(f"/equivalents GET active='{active}' mg={mg_val} form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
 
         local_finder = eq_finder
         if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
             local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
 
-        eq_results = local_finder.find_equivalents(
-            active_query=active.strip(),
-            target_mg=mg_val,
-            tolerance_mg=tol,
-            allow_per_ml=allow_per_ml,
-            target_form=form,
-            strict_form=strict_form,
-            limit=limit,
-            debug=debug_flag,
-        )
-        exclude_ids = {str(r.get('id')) for r in eq_results}
-        alt_results = local_finder.find_alternatives(
-            active_query=active.strip(),
-            target_form=form,
-            strict_form=strict_form,
-            limit=limit,
-            exclude_ids=exclude_ids,
-            debug=debug_flag,
-        )
+        if actives_list:
+            eq_results = local_finder.find_equivalents_multi(
+                actives=actives_list,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                debug=debug_flag,
+            )
+            exclude_ids = {str(r.get('id')) for r in eq_results}
+            alt_results = local_finder.find_alternatives_multi(
+                actives=actives_list,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                exclude_ids=exclude_ids,
+                debug=debug_flag,
+            )
+        else:
+            eq_results = local_finder.find_equivalents(
+                active_query=active.strip(),
+                target_mg=mg_val,
+                tolerance_mg=tol,
+                allow_per_ml=allow_per_ml,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                debug=debug_flag,
+            )
+            exclude_ids = {str(r.get('id')) for r in eq_results}
+            alt_results = local_finder.find_alternatives(
+                active_query=active.strip(),
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                exclude_ids=exclude_ids,
+                debug=debug_flag,
+            )
         logger.info(f"/equivalents -> equivalents={len(eq_results)} alternatives={len(alt_results)}")
         return app.response_class(
             response=json.dumps({
@@ -190,14 +223,17 @@ def equivalents_post():
         return jsonify({"error": "expected application/json body"}), 400
     payload = request.get_json(silent=True) or {}
 
+    # دعم إدخال متعدد المواد عبر actives (list of dict/name+mg). لو غير متاح نرجع للنمط القديم
+    actives_list = payload.get("actives")
     active = (payload.get("active") or "").strip()
-    if not active:
-        return jsonify({"error": "missing 'active' in JSON body"}), 400
-
-    try:
-        mg_val = float(payload.get("mg"))
-    except Exception:
-        return jsonify({"error": "invalid 'mg' in JSON body, must be a number (mg)"}), 400
+    mg_val = None
+    if not actives_list:
+        if not active:
+            return jsonify({"error": "missing 'active' in JSON body or provide 'actives' list"}), 400
+        try:
+            mg_val = float(payload.get("mg"))
+        except Exception:
+            return jsonify({"error": "invalid 'mg' in JSON body, must be a number (mg)"}), 400
 
     form = payload.get("form")
     tol = float(payload.get("tol") or 0.0)
@@ -211,31 +247,52 @@ def equivalents_post():
     try:
         if debug_flag:
             logger.setLevel(logging.DEBUG)
-        logger.info(f"/equivalents POST active='{active}' mg={mg_val} form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
+        if actives_list:
+            logger.info(f"/equivalents POST actives(list) form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
+        else:
+            logger.info(f"/equivalents POST active='{active}' mg={mg_val} form='{form}' tol={tol} strict={strict_form} per_ml={allow_per_ml} topk={topk} minbase={minbase}")
 
         local_finder = eq_finder
         if topk != EQ_TOP_K or minbase != EQ_MIN_BASE10:
             local_finder = EquivalentsFinder(top_k=topk, min_base10=minbase)
 
-        eq_results = local_finder.find_equivalents(
-            active_query=active,
-            target_mg=mg_val,
-            tolerance_mg=tol,
-            allow_per_ml=allow_per_ml,
-            target_form=form,
-            strict_form=strict_form,
-            limit=limit,
-            debug=debug_flag,
-        )
-        exclude_ids = {str(r.get('id')) for r in eq_results}
-        alt_results = local_finder.find_alternatives(
-            active_query=active,
-            target_form=form,
-            strict_form=strict_form,
-            limit=limit,
-            exclude_ids=exclude_ids,
-            debug=debug_flag,
-        )
+        if actives_list:
+            eq_results = local_finder.find_equivalents_multi(
+                actives=actives_list,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                debug=debug_flag,
+            )
+            exclude_ids = {str(r.get('id')) for r in eq_results}
+            alt_results = local_finder.find_alternatives_multi(
+                actives=actives_list,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                exclude_ids=exclude_ids,
+                debug=debug_flag,
+            )
+        else:
+            eq_results = local_finder.find_equivalents(
+                active_query=active,
+                target_mg=mg_val,
+                tolerance_mg=tol,
+                allow_per_ml=allow_per_ml,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                debug=debug_flag,
+            )
+            exclude_ids = {str(r.get('id')) for r in eq_results}
+            alt_results = local_finder.find_alternatives(
+                active_query=active,
+                target_form=form,
+                strict_form=strict_form,
+                limit=limit,
+                exclude_ids=exclude_ids,
+                debug=debug_flag,
+            )
         logger.info(f"/equivalents -> equivalents={len(eq_results)} alternatives={len(alt_results)}")
         return app.response_class(
             response=json.dumps({
