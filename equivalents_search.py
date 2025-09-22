@@ -192,6 +192,21 @@ def grab_all_numbers(text: str) -> List[float]:
         return []
     return [float(x) for x in NUM_PATTERN.findall(str(text))]
 
+def _concentrations_list_to_text(val: Any) -> str:
+    """حوّل قائمة [{اسم: رقم}] إلى نص موحّد مثل: 'اسم 20 / اسم 1680'."""
+    try:
+        if isinstance(val, list):
+            parts: List[str] = []
+            for item in val:
+                if isinstance(item, dict) and len(item) == 1:
+                    [(k, v)] = list(item.items())
+                    parts.append(f"{k} {v}")
+            if parts:
+                return " / ".join(parts)
+    except Exception:
+        pass
+    return ""
+
 def collect_concentration_texts(meta: Dict[str, Any]) -> str:
     """
     نجمع كل الحقول التي قد تحتوي أرقام تركيز:
@@ -208,6 +223,10 @@ def collect_concentration_texts(meta: Dict[str, Any]) -> str:
         v = (meta or {}).get(k)
         if isinstance(v, str) and v.strip():
             parts.append(v)
+        elif k in ("concentrations", "التراكيز") and isinstance(v, list):
+            rendered = _concentrations_list_to_text(v)
+            if rendered:
+                parts.append(rendered)
     return " | ".join(parts)
 
 def find_number_near_active(text: str, active_norm: str, window: int = 25) -> Optional[float]:
@@ -246,6 +265,78 @@ def has_exact_concentration(meta: Dict[str, Any], active_norm: str, target_mg: f
         if abs(n - target_mg) < 1e-6:
             return True, n
     return False, near
+
+# ---- تحويل التراكيز إلى قائمة {مادة: رقم} في الخرج ----
+_SEG_SPLIT = re.compile(r"[\/\+;,؛،]|(?:\s+و\s+)|(?:\s+and\s+)", re.IGNORECASE)
+_NUM_ONLY = re.compile(r"\d+(?:\.\d+)?")
+_UNITS_PATTERN = re.compile(r"\b(?:mg|mcg|ug|g|ml|iu|%|ملغ|مجم|ملغم|ميليجرام|ميليغرام|ميكروجرام|ميكروغرام|جرام|جم|مل)\b", re.IGNORECASE)
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+def _to_ascii_digits(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text)
+    return text.translate(_ARABIC_DIGITS)
+
+def _clean_material_name(raw_name: str) -> str:
+    if not isinstance(raw_name, str):
+        return ""
+    s = _to_ascii_digits(raw_name)
+    s = _UNITS_PATTERN.sub(" ", s)
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = re.sub(r"[^A-Za-z\-\s\u0600-\u06FF]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+_NAME_NUM_PATTERN = re.compile(r"([A-Za-z\u0600-\u06FF][A-Za-z\u0600-\u06FF\-\s\(\)]+?)\s*(\d+(?:\.\d+)?)")
+
+def parse_concentrations_from_meta(meta: Dict[str, Any]) -> List[Dict[str, float]]:
+    if not isinstance(meta, dict):
+        return []
+    val = meta.get("concentrations")
+    if isinstance(val, list):
+        try:
+            ok = all(isinstance(x, dict) and len(x) == 1 for x in val)
+            return val if ok else []
+        except Exception:
+            return []
+    if not isinstance(val, str) or not val.strip():
+        return []
+    text = _to_ascii_digits(val)
+    text_simple = _UNITS_PATTERN.sub(" ", text)
+    pairs: List[Dict[str, float]] = []
+    for name, num in _NAME_NUM_PATTERN.findall(text_simple):
+        name_clean = _clean_material_name(name)
+        if not name_clean:
+            continue
+        try:
+            vf = float(num)
+            v = int(vf) if abs(vf - int(vf)) < 1e-9 else vf
+            pairs.append({name_clean: v})
+        except Exception:
+            continue
+    if pairs:
+        return pairs
+    nums = [float(x) for x in _NUM_ONLY.findall(text_simple)]
+    if not nums:
+        return []
+    ai_text = (meta.get("active_ingredients") or meta.get("المواد الفعالة") or "")
+    if isinstance(ai_text, str) and ai_text.strip():
+        raw_tokens = [t.strip() for t in _SEG_SPLIT.split(ai_text) if t and t.strip()]
+        names = [_clean_material_name(t) for t in raw_tokens if _clean_material_name(t)]
+        if len(names) == len(nums):
+            out: List[Dict[str, float]] = []
+            for nm, vf in zip(names, nums):
+                v = int(vf) if abs(vf - int(vf)) < 1e-9 else vf
+                out.append({nm: v})
+            return out
+    if len(nums) == 1:
+        sci = meta.get("scientific_name") or meta.get("الاسم العلمي") or ai_text
+        nm = _clean_material_name(str(sci or "").strip())
+        if nm:
+            vf = nums[0]
+            v = int(vf) if abs(vf - int(vf)) < 1e-9 else vf
+            return [{nm: v}]
+    return []
 
 # ======================= EquivalentsFinder =======================
 class EquivalentsFinder:
@@ -440,6 +531,16 @@ class EquivalentsFinder:
             if is_relevant:
                 conc_exact, conc_num = has_exact_concentration(meta, active_norm, target_mg)
 
+            # طبّق تحويل التراكيز إلى قائمة عند توفرها
+            meta_out = dict(meta or {})
+            try:
+                parsed_conc = parse_concentrations_from_meta(meta_out)
+                if parsed_conc:
+                    meta_out["concentrations_raw"] = meta_out.get("concentrations")
+                    meta_out["concentrations"] = parsed_conc
+            except Exception:
+                pass
+
             row = {
                 "id": _id,
                 "query": active_query,
@@ -452,7 +553,7 @@ class EquivalentsFinder:
                 "commercial_name": brand or (meta or {}).get("commercial_name") or (meta or {}).get("الاسم التجاري"),
                 "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
                 "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
-                "meta": meta,
+                "meta": meta_out,
                 "doc": doc,
                 # مفاتيح مساعدة للفرز النهائي:
                 "_relevant": is_relevant,
@@ -619,6 +720,16 @@ class EquivalentsFinder:
                 bonus += ALT_SECTION_MATCH_BONUS
                 tag_parts.append("section_match")
 
+            # طبّق تحويل التراكيز إلى قائمة عند توفرها
+            meta_out = dict(meta or {})
+            try:
+                parsed_conc = parse_concentrations_from_meta(meta_out)
+                if parsed_conc:
+                    meta_out["concentrations_raw"] = meta_out.get("concentrations")
+                    meta_out["concentrations"] = parsed_conc
+            except Exception:
+                pass
+
             row = {
                 "id": _id,
                 "query": active_query,
@@ -631,7 +742,7 @@ class EquivalentsFinder:
                 "commercial_name": brand or (meta or {}).get("commercial_name") or (meta or {}).get("الاسم التجاري"),
                 "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
                 "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
-                "meta": meta,
+                "meta": meta_out,
                 "doc": doc,
                 # مفاتيح مساعدة للفرز
                 "_overlap": overlap,

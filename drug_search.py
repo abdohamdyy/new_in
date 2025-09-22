@@ -178,6 +178,98 @@ def best_brand_field(meta: Dict[str, Any]) -> str:
     return ""
 
 
+# ---- تحويل التراكيز إلى قائمة {مادة: رقم} ----
+_SEG_SPLIT = re.compile(r"[\/\+;,؛،]|(?:\s+و\s+)|(?:\s+and\s+)", re.IGNORECASE)
+_NUM_PATTERN = re.compile(r"\d+(?:\.\d+)?")
+_UNITS_PATTERN = re.compile(r"\b(?:mg|mcg|ug|g|ml|iu|%|ملغ|مجم|ملغم|ميليجرام|ميليغرام|ميكروجرام|ميكروغرام|جرام|جم|مل)\b", re.IGNORECASE)
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+def _to_ascii_digits(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text)
+    return text.translate(_ARABIC_DIGITS)
+
+def _clean_material_name(raw_name: str) -> str:
+    if not isinstance(raw_name, str):
+        return ""
+    s = _to_ascii_digits(raw_name)
+    # أزل الوحدات إن وُجدت ضمن الاسم بالخطأ
+    s = _UNITS_PATTERN.sub(" ", s)
+    # أزل الأقواس والمحتوى الزائد بعد الأرقام
+    s = re.sub(r"\(.*?\)", " ", s)
+    # أبق حروف عربية/لاتينية والمسافات والواصلات فقط
+    s = re.sub(r"[^A-Za-z\-\s\u0600-\u06FF]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+_NAME_NUM_PATTERN = re.compile(r"([A-Za-z\u0600-\u06FF][A-Za-z\u0600-\u06FF\-\s\(\)]+?)\s*(\d+(?:\.\d+)?)")
+
+def parse_concentrations_from_meta(meta: Dict[str, Any]) -> List[Dict[str, float]]:
+    """يحاول تحويل concentrations النصية إلى قائمة [{مادة: تركيز}].
+    - يعتمد أولاً على نص يحتوي أزواج (اسم ثم رقم)
+    - وإلا: يحاول مواءمة الأرقام مع المواد من active_ingredients بنفس الترتيب
+    - يعيد أرقامًا كـ int إن كانت صحيحة وإلا float
+    """
+    if not isinstance(meta, dict):
+        return []
+    val = meta.get("concentrations")
+    if isinstance(val, list):
+        # نفترض أنها بالفعل بالشكل المطلوب
+        try:
+            ok = all(isinstance(x, dict) and len(x) == 1 for x in val)
+            return val if ok else []
+        except Exception:
+            return []
+    if not isinstance(val, str) or not val.strip():
+        return []
+
+    text = _to_ascii_digits(val)
+    # أزل وحدات واضحة لتسهيل التعرف
+    text_simple = _UNITS_PATTERN.sub(" ", text)
+
+    pairs = []
+    # التقط أزواج (اسم ثم رقم) عبر النص كله
+    for name, num in _NAME_NUM_PATTERN.findall(text_simple):
+        name_clean = _clean_material_name(name)
+        if not name_clean:
+            continue
+        try:
+            vf = float(num)
+            v = int(vf) if abs(vf - int(vf)) < 1e-9 else vf
+            pairs.append({name_clean: v})
+        except Exception:
+            continue
+
+    if pairs:
+        return pairs
+
+    # إن لم نجد أسماء صريحة بجانب الأرقام، جرّب مواءمة الأرقام مع المواد من active_ingredients
+    nums = [float(x) for x in _NUM_PATTERN.findall(text_simple)]
+    if not nums:
+        return []
+    ai_text = (meta.get("active_ingredients") or meta.get("المواد الفعالة") or "")
+    if isinstance(ai_text, str) and ai_text.strip():
+        raw_tokens = [t.strip() for t in _SPLIT_ACTIVE.split(ai_text) if t and t.strip()]
+        names = [_clean_material_name(t) for t in raw_tokens if _clean_material_name(t)]
+        if len(names) == len(nums):
+            out: List[Dict[str, float]] = []
+            for nm, vf in zip(names, nums):
+                v = int(vf) if abs(vf - int(vf)) < 1e-9 else vf
+                out.append({nm: v})
+            return out
+
+    # محاولة نهائية: لو رقم واحد ومادة واحدة في scientific_name/active_ingredients
+    if len(nums) == 1:
+        sci = meta.get("scientific_name") or meta.get("الاسم العلمي") or ai_text
+        nm = _clean_material_name(str(sci or "").strip())
+        if nm:
+            vf = nums[0]
+            v = int(vf) if abs(vf - int(vf)) < 1e-9 else vf
+            return [{nm: v}]
+
+    return []
+
+
 class DrugSearch:
     """
     - يهيّئ Chroma + Embeddings مرة واحدة
@@ -318,6 +410,16 @@ class DrugSearch:
 
             final_score = base_score + bonus
 
+            # طبّق تحويل التراكيز إلى قائمة عند توفرها
+            meta_out = dict(meta or {})
+            try:
+                parsed_conc = parse_concentrations_from_meta(meta_out)
+                if parsed_conc:
+                    meta_out["concentrations_raw"] = meta_out.get("concentrations")
+                    meta_out["concentrations"] = parsed_conc
+            except Exception:
+                pass
+
             row = {
                 "id": _id,
                 "query": query,
@@ -331,7 +433,7 @@ class DrugSearch:
                 "scientific_name": (meta or {}).get("scientific_name") or (meta or {}).get("الاسم العلمي"),
                 "manufacturer": (meta or {}).get("manufacturer") or (meta or {}).get("الشركة المصنعة"),
                 # كل الميتاداتا كاملة كما هي:
-                "meta": meta,
+                "meta": meta_out,
                 # نص الدوكيومنت لو موجود:
                 "doc": doc,
             }
