@@ -41,6 +41,69 @@ def normalize_ar(text: str) -> str:
                 .replace("ؤ","و").replace("ئ","ي"))
     return re.sub(r"\s+", " ", text).strip().lower()
 
+# ---- كشف الإنجليزية وتوليد بدائل عربية تقريبية (ترانسلترشن مبسّط) ----
+_HAS_LATIN = re.compile(r"[A-Za-z]")
+
+def is_latin_text(text: str) -> bool:
+    return bool(text) and bool(_HAS_LATIN.search(str(text)))
+
+def latin_to_arabic_variants(text: str) -> List[str]:
+    """
+    يحاول توليد تهجئات عربية قريبة من الاسم الإنجليزي لرفع وزن الفزي على التجاري.
+    أمثلة: "panadol" -> ["بانادول", "بنادول"]
+    قواعد مبسّطة جدًا وواقعية للأسماء الشائعة؛ ليست مثالية لكنها عملية.
+    """
+    if not isinstance(text, str):
+        return []
+    s = text.strip().lower()
+    if not s:
+        return []
+
+    # أولاً: أزواج حروف شائعة قبل الحرف المنفرد
+    digraphs = [
+        ("sh", "ش"), ("ch", "تش"), ("th", "ث"), ("ph", "ف"),
+        ("gh", "غ"), ("kh", "خ"), ("oo", "و"), ("ou", "و"),
+        ("ee", "ي"), ("ea", "ي"), ("ai", "اي"), ("ie", "ي"),
+    ]
+    tmp = s
+    for en, ar in digraphs:
+        tmp = tmp.replace(en, f" {ar} ")  # نحجزها مؤقتًا بمسافات
+
+    # بعدها حروف منفردة
+    char_map = {
+        'a': 'ا', 'b': 'ب', 'c': 'ك', 'd': 'د', 'e': 'ي', 'f': 'ف', 'g': 'ج',
+        'h': 'ه', 'i': 'ي', 'j': 'ج', 'k': 'ك', 'l': 'ل', 'm': 'م', 'n': 'ن',
+        'o': 'و', 'p': 'ب', 'q': 'ق', 'r': 'ر', 's': 'س', 't': 'ت', 'u': 'و',
+        'v': 'ف', 'w': 'و', 'x': 'كس', 'y': 'ي', 'z': 'ز'
+    }
+    out = []
+    for ch in tmp:
+        if ch == ' ':
+            out.append(' ')
+        elif 'a' <= ch <= 'z':
+            out.append(char_map.get(ch, ch))
+        else:
+            out.append(ch)
+    cand = re.sub(r"\s+", "", "".join(out))
+
+    # تحسينات خفيفة: ضغط الحروف الممدودة الشائعة
+    cand = cand.replace("يي", "ي").replace("وو", "و")
+
+    variants = {cand}
+
+    # متغير: إسقاط ألف بعد باء البداية لإنتاج شكل دارج (بانادول → بنادول)
+    if cand.startswith("با"):
+        variants.add("ب" + cand[2:])
+
+    # متغير: معالجة ch→تش قد تكون ك→تش والعكس (ننتج بديلًا بحرف ك)
+    variants.add(cand.replace("تش", "ش"))
+    variants.add(cand.replace("تش", "ك"))
+
+    # تنظيف وحصر طول معقول
+    clean = [v for v in variants if 2 <= len(v) <= 64]
+    # إعادة التطبيع لضمان اتساق المقارنة الفزي لاحقًا
+    return list({normalize_ar(v) for v in clean})
+
 def distance_to_score10(d: Optional[float]) -> float:
     """حوّل مسافة كوساين (0..2) إلى درجة تشابه 0..10."""
     if d is None: return 0.0
@@ -178,11 +241,40 @@ class DrugSearch:
         tk = top_k if top_k is not None else self.top_k
         ms = min_score10 if min_score10 is not None else self.min_score10
 
-        res = self._query_once(query)
-        ids_list   = res.get("ids", [[]])[0]
-        dists_list = res.get("distances", [[]])[0]
-        metas_list = res.get("metadatas", [[]])[0]
-        docs_list  = res.get("documents", [[]])[0]
+        # اجلب نتائج المتجهات. عند إدخال إنجليزي، نجرب أيضًا بدائل عربية (ترانسلترشن) وندمج.
+        primary = self._query_once(query)
+
+        pools = [primary]
+        ar_qs: List[str] = []
+        if is_latin_text(query):
+            ar_qs = latin_to_arabic_variants(query)
+            for aq in ar_qs[:3]:  # نحد حتى 3 بدائل لأداء جيد
+                try:
+                    pools.append(self._query_once(aq))
+                except Exception:
+                    continue
+
+        merged: Dict[str, Tuple[float, Dict[str, Any], Any]] = {}
+        for res in pools:
+            ids   = res.get("ids", [[]])[0]
+            dists = res.get("distances", [[]])[0]
+            metas = res.get("metadatas", [[]])[0]
+            docs  = res.get("documents", [[]])[0]
+            for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                if _id is None:
+                    continue
+                if (_id not in merged) or (dist is not None and dist < merged[_id][0]):
+                    merged[_id] = (dist, meta, doc)
+
+        ids_list: List[str] = []
+        dists_list: List[float] = []
+        metas_list: List[Dict[str, Any]] = []
+        docs_list: List[Any] = []
+        for _id, (dist, meta, doc) in merged.items():
+            ids_list.append(_id)
+            dists_list.append(dist)
+            metas_list.append(meta)
+            docs_list.append(doc)
 
         q_norm = normalize_ar(query)
         rows: List[Dict[str, Any]] = []
@@ -197,7 +289,17 @@ class DrugSearch:
             tag   = "vector_only"
 
             # (1) Fuzzy على الاسم التجاري token-by-token + length penalty
-            ratio, token, penalty = best_token_fuzzy_ratio(brand or "", q_norm)
+            # نحسب أفضل فزي عبر الاستعلام الأصلي + بدائل عربية إن وُجدت
+            q_candidates = [q_norm]
+            if ar_qs:
+                q_candidates.extend(ar_qs)
+            ratio = 0.0
+            token = ""
+            penalty = 1.0
+            for qv in q_candidates:
+                r, t, p = best_token_fuzzy_ratio(brand or "", qv)
+                if r * p > ratio * penalty:
+                    ratio, token, penalty = r, t, p
             if ratio >= BRAND_FUZZY_MIN:
                 fuzzy_boost = FUZZY_BRAND_BOOST * ratio * penalty
                 bonus += fuzzy_boost
