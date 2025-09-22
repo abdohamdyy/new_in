@@ -39,7 +39,7 @@ services:
       --access-logfile -
       --error-logfile -
       --timeout 120
-      --log-level ${LOG_LEVEL}
+      --log-level $${LOG_LEVEL:-DEBUG}
 
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5543/health"]
