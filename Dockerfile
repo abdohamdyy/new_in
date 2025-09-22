@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # نزّل المتطلبات لو موجودة (مرن: لو مفيش requirements مش هيكسر)
-COPY requirements*.txt /tmp/ 2>/dev/null || true
+COPY requirements*.txt /tmp/
 RUN python -m pip install --upgrade pip && \
     if [ -f /tmp/requirements.txt ]; then pip install -r /tmp/requirements.txt; fi && \
     if [ -f /tmp/requirements-dev.txt ]; then pip install -r /tmp/requirements-dev.txt; fi

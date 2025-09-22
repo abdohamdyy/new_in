@@ -1,7 +1,6 @@
-version: "3.9"
-
 services:
   duaya_api:
+    pull_policy: never
     build:
       context: .
       dockerfile: Dockerfile
