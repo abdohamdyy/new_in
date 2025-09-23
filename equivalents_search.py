@@ -25,11 +25,15 @@ import re
 import unicodedata
 import difflib
 from typing import List, Dict, Any, Optional, Tuple, Set
+import logging
 
 import chromadb
 from chromadb.config import Settings
 from langchain_huggingface import HuggingFaceEmbeddings
 from config import Config
+
+# لوجر مخصص للمثائل، يتبع duaya_api
+logger = logging.getLogger("duaya_api.eq")
 
 # ======================= ثوابت وأوزان =======================
 # أوزان البونصات: المواد الفعّالة أعلى من العلمي، والعلمي أعلى من التجاري
@@ -825,11 +829,15 @@ class EquivalentsFinder:
         actives: قائمة مثل [{"باراسيتامول": 500}, {"سودوإيفيدرين": 30}, {"دكستروميثورفان": 15}]
         """
         pairs = normalize_actives_input(actives)
+        if debug:
+            logger.debug("[multi] normalized pairs: %s", pairs)
         if not pairs:
             return []
 
         # 1) اجمع مرشحين من استعلامات لكل مادة + استعلامات مركبة (الكل + أزواج)
         q_norm_list = [nm for (nm, _mg) in pairs]
+        if debug:
+            logger.debug("[multi] q_norm_list: %s", q_norm_list)
         merged: Dict[str, Dict[str, Any]] = {}
         # استعلامات فردية
         for qn in q_norm_list:
@@ -838,6 +846,9 @@ class EquivalentsFinder:
                 self._query_scientific_only(qn),
                 self._query_brand(qn),
             ):
+                if debug:
+                    ids_dbg = res.get("ids", [[]])[0]
+                    logger.debug("[multi] single-query '%s' -> %d hits", qn, len(ids_dbg))
                 ids   = res.get("ids", [[]])[0]
                 dists = res.get("distances", [[]])[0]
                 metas = res.get("metadatas", [[]])[0]
@@ -848,36 +859,69 @@ class EquivalentsFinder:
 
         # استعلام مركّب بكل المواد
         if len(q_norm_list) >= 2:
-            joined = " | ".join(q_norm_list)
-            for res in (
-                self._query_active_first(joined),
-                self._query_scientific_only(joined),
-                self._query_brand(joined),
-            ):
-                ids   = res.get("ids", [[]])[0]
-                dists = res.get("distances", [[]])[0]
-                metas = res.get("metadatas", [[]])[0]
-                docs  = res.get("documents", [[]])[0]
-                for _id, dist, meta, doc in zip(ids, dists, metas, docs):
-                    if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
-                        merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+            joined = "، ".join(q_norm_list)
+            # نوسّع n_results للتركيبات
+            try:
+                prompts = [
+                    f"active ingredients or scientific: {joined}",
+                    f"scientific name: {joined}",
+                    f"brand or commercial name: {joined}",
+                ]
+                for prompt in prompts:
+                    q_emb = self.emb.embed_query(prompt)
+                    res = self.collection.query(
+                        query_embeddings=[q_emb],
+                        n_results=min(self.top_k * 3, 5000),
+                        include=["distances", "metadatas", "documents"],
+                    )
+                    if debug:
+                        ids_dbg = res.get("ids", [[]])[0]
+                        logger.debug("[multi] joined all prompt='%s' -> %d hits", prompt, len(ids_dbg))
+                    ids   = res.get("ids", [[]])[0]
+                    dists = res.get("distances", [[]])[0]
+                    metas = res.get("metadatas", [[]])[0]
+                    docs  = res.get("documents", [[]])[0]
+                    for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                        if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
+                            merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+            except Exception as e:
+                if debug:
+                    logger.debug("[multi] joined all query failed: %s", e)
 
         # استعلامات أزواج (تحسين تذكّر التركيبات)
         if len(q_norm_list) >= 3:
             for i in range(len(q_norm_list)):
                 for j in range(i + 1, len(q_norm_list)):
-                    pair_join = f"{q_norm_list[i]} | {q_norm_list[j]}"
-                    for res in (
-                        self._query_active_first(pair_join),
-                        self._query_scientific_only(pair_join),
-                    ):
-                        ids   = res.get("ids", [[]])[0]
-                        dists = res.get("distances", [[]])[0]
-                        metas = res.get("metadatas", [[]])[0]
-                        docs  = res.get("documents", [[]])[0]
-                        for _id, dist, meta, doc in zip(ids, dists, metas, docs):
-                            if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
-                                merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+                    pair_join = f"{q_norm_list[i]}، {q_norm_list[j]}"
+                    try:
+                        prompts = [
+                            f"active ingredients or scientific: {pair_join}",
+                            f"scientific name: {pair_join}",
+                            f"brand or commercial name: {pair_join}",
+                        ]
+                        for prompt in prompts:
+                            q_emb = self.emb.embed_query(prompt)
+                            res = self.collection.query(
+                                query_embeddings=[q_emb],
+                                n_results=min(self.top_k * 2, 4000),
+                                include=["distances", "metadatas", "documents"],
+                            )
+                            if debug:
+                                ids_dbg = res.get("ids", [[]])[0]
+                                logger.debug("[multi] pair prompt='%s' -> %d hits", prompt, len(ids_dbg))
+                            ids   = res.get("ids", [[]])[0]
+                            dists = res.get("distances", [[]])[0]
+                            metas = res.get("metadatas", [[]])[0]
+                            docs  = res.get("documents", [[]])[0]
+                            for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                                if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
+                                    merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+                    except Exception as e:
+                        if debug:
+                            logger.debug("[multi] pair query failed '%s': %s", pair_join, e)
+
+        if debug:
+            logger.debug("[multi] merged candidates: %d", len(merged))
 
         # 2) ابنِ الصفوف مع حساب المطابقات عبر كل المواد
         rows: List[Dict[str, Any]] = []
@@ -989,6 +1033,15 @@ class EquivalentsFinder:
             if matched_count <= 0:
                 continue
             rows.append(row)
+            if debug and matched_count > 0:
+                try:
+                    brand_dbg = best_brand_field(meta)
+                    logger.debug(
+                        "[multi] cand id=%s brand=%s matched=%d exact=%d base=%.3f final=%.3f",
+                        _id, brand_dbg, matched_count, exact_conc_count, base_score, row["final_score"],
+                    )
+                except Exception:
+                    pass
 
         # 3) الفرز النهائي: عدد المطابقات ثم عدد تراكيز مطابقة ثم final_score ثم base
         rows.sort(key=lambda x: (

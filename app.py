@@ -137,7 +137,7 @@ def equivalents_get():
     limit = request.args.get("limit", type=int) or EQ_LIMIT
     topk = request.args.get("topk", type=int) or EQ_TOP_K
     minbase = request.args.get("minbase", type=float) or EQ_MIN_BASE10
-    debug_flag = parse_bool(request.args.get("debug"), False)
+    debug_flag = parse_bool(request.args.get("debug"), True)
 
     try:
         if debug_flag:
@@ -242,7 +242,7 @@ def equivalents_post():
     limit = int(payload.get("limit") or EQ_LIMIT)
     topk = int(payload.get("topk") or EQ_TOP_K)
     minbase = float(payload.get("minbase") or EQ_MIN_BASE10)
-    debug_flag = parse_bool(payload.get("debug"), False)
+    debug_flag = parse_bool(payload.get("debug"), True)
 
     try:
         if debug_flag:
@@ -309,4 +309,4 @@ def equivalents_post():
 
 if __name__ == "__main__":
     # في التطوير بنستخدم Flask مباشرة؛ داخل Docker يفضل gunicorn
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5543")), debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5543")), debug=True)
