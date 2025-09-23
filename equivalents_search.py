@@ -828,11 +828,16 @@ class EquivalentsFinder:
         if not pairs:
             return []
 
-        # 1) اجمع مرشحين من استعلامات لكل مادة
+        # 1) اجمع مرشحين من استعلامات لكل مادة + استعلامات مركبة (الكل + أزواج)
         q_norm_list = [nm for (nm, _mg) in pairs]
         merged: Dict[str, Dict[str, Any]] = {}
+        # استعلامات فردية
         for qn in q_norm_list:
-            for res in (self._query_active_first(qn), self._query_scientific_only(qn), self._query_brand(qn)):
+            for res in (
+                self._query_active_first(qn),
+                self._query_scientific_only(qn),
+                self._query_brand(qn),
+            ):
                 ids   = res.get("ids", [[]])[0]
                 dists = res.get("distances", [[]])[0]
                 metas = res.get("metadatas", [[]])[0]
@@ -840,6 +845,39 @@ class EquivalentsFinder:
                 for _id, dist, meta, doc in zip(ids, dists, metas, docs):
                     if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
                         merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+
+        # استعلام مركّب بكل المواد
+        if len(q_norm_list) >= 2:
+            joined = " | ".join(q_norm_list)
+            for res in (
+                self._query_active_first(joined),
+                self._query_scientific_only(joined),
+                self._query_brand(joined),
+            ):
+                ids   = res.get("ids", [[]])[0]
+                dists = res.get("distances", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+                docs  = res.get("documents", [[]])[0]
+                for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                    if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
+                        merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
+
+        # استعلامات أزواج (تحسين تذكّر التركيبات)
+        if len(q_norm_list) >= 3:
+            for i in range(len(q_norm_list)):
+                for j in range(i + 1, len(q_norm_list)):
+                    pair_join = f"{q_norm_list[i]} | {q_norm_list[j]}"
+                    for res in (
+                        self._query_active_first(pair_join),
+                        self._query_scientific_only(pair_join),
+                    ):
+                        ids   = res.get("ids", [[]])[0]
+                        dists = res.get("distances", [[]])[0]
+                        metas = res.get("metadatas", [[]])[0]
+                        docs  = res.get("documents", [[]])[0]
+                        for _id, dist, meta, doc in zip(ids, dists, metas, docs):
+                            if _id not in merged or (dist is not None and dist < merged[_id]["dist"]):
+                                merged[_id] = {"dist": dist, "meta": meta, "doc": doc}
 
         # 2) ابنِ الصفوف مع حساب المطابقات عبر كل المواد
         rows: List[Dict[str, Any]] = []
