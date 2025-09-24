@@ -17,6 +17,8 @@ services:
       TOKENIZERS_PARALLELISM: "false"
       FLASK_ENV: development
       DEBUG: "true"
+      HMAC_CLIENT_SECRETS: '{"duaya_index":"8ef5373b3b8b5aa0af7059f16bf8030657aa34e4bc5389f6290cfc0e6adef442","salamtk":"681ecfe6acf5bc26d5898046b51ddf8f45add546ae10ff5b33cbb950d66da64e"}'
+      HMAC_TTL_SECONDS: "300"
 
     ports:
       - "5543:5543"

@@ -3,7 +3,12 @@ from __future__ import annotations
 import os
 import json
 import logging
-from flask import Flask, request, jsonify
+import hmac
+import hashlib
+import time
+from functools import wraps
+from typing import Optional, Dict, Any
+from flask import Flask, request, jsonify, g
 
 from drug_search import DrugSearch, DEFAULT_TOP_K, DEFAULT_MIN_SCORE10
 from equivalents_search import EquivalentsFinder  # ملف المثائل
@@ -41,12 +46,129 @@ def parse_bool(val, default: bool) -> bool:
     s = str(val).strip().lower()
     return s in ("1", "true", "t", "yes", "y", "on", "اه", "ايوه")
 
+# ================= أمان HMAC حسب كل عميل =================
+# يمكن تعريف الأسرار عبر متغير بيئة JSON: HMAC_CLIENT_SECRETS='{"duaya_index":"secret1","salamtk":"secret2"}'
+# أو عبر متغيرات بيئة منفصلة: HMAC_SECRET_DUAYA_INDEX=... , HMAC_SECRET_SALAMTK=...
+HMAC_TTL_SECONDS = int(os.getenv("HMAC_TTL_SECONDS", "300"))  # مهلة التوقيع (ثواني)
+
+def _load_client_secrets() -> Dict[str, str]:
+    secrets: Dict[str, str] = {}
+    raw = os.getenv("HMAC_CLIENT_SECRETS", "").strip()
+    if raw:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(k, str) and isinstance(v, str) and v:
+                        secrets[k.strip().lower()] = v.strip()
+        except Exception:
+            logger.warning("Failed to parse HMAC_CLIENT_SECRETS; falling back to HMAC_SECRET_* vars")
+    # دعم HMAC_SECRET_*
+    prefix = "HMAC_SECRET_"
+    for env_name, env_value in os.environ.items():
+        if env_name.startswith(prefix) and env_value:
+            client = env_name[len(prefix):].strip().lower()
+            if client and client not in secrets:
+                secrets[client] = env_value.strip()
+    return secrets
+
+CLIENT_SECRETS: Dict[str, str] = _load_client_secrets()
+
+def _get_client_secret(client_id: str) -> Optional[str]:
+    if not client_id:
+        return None
+    return CLIENT_SECRETS.get(str(client_id).strip().lower())
+
+def _build_payload_to_sign(req) -> str:
+    # نبني تمثيلاً ثابتاً للباراميترز/البودي لضمان تطابق الحساب بين العميل والسيرفر
+    if req.method == "GET":
+        items: Dict[str, Any] = {}
+        # request.args قد تحتوي على مفاتيح متعددة القيم؛ نحولها إلى list عند الحاجة
+        auth_keys = {"client", "timestamp", "ts", "hashkey", "signature"}
+        for key in sorted(req.args.keys()):
+            if key.strip().lower() in auth_keys:
+                continue
+            values = req.args.getlist(key)
+            if len(values) == 1:
+                items[key] = values[0]
+            else:
+                items[key] = values
+        try:
+            return json.dumps(items, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        except Exception:
+            return ""
+    else:
+        if req.is_json:
+            payload = req.get_json(silent=True)
+            if isinstance(payload, dict):
+                # احذف مفاتيح الأوث
+                for k in ["client", "client_id", "timestamp", "ts", "hashKey", "signature"]:
+                    if k in payload:
+                        payload.pop(k)
+            try:
+                return json.dumps(payload if payload is not None else {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            except Exception:
+                return ""
+        data = req.get_data(cache=False) or b""
+        try:
+            return data.decode("utf-8")
+        except Exception:
+            return ""
+
+def _compute_signature(secret: str, method: str, path: str, timestamp: str, payload_str: str) -> str:
+    base = f"method={method.upper()}&path={path}&ts={timestamp}&payload={payload_str}"
+    return hmac.new(secret.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def require_hmac(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # ندعم إما الهيدر القياسي أو نمط الحقول داخل الاستعلام/البودي (client,timestamp,hashKey)
+        client_id = request.headers.get("X-Client-Id") or request.args.get("client")
+        ts = request.headers.get("X-Timestamp") or request.args.get("timestamp")
+        sig = request.headers.get("X-Signature") or request.args.get("hashKey")
+
+        if (not client_id or not ts or not sig) and request.is_json:
+            body = request.get_json(silent=True) or {}
+            client_id = client_id or body.get("client") or body.get("client_id")
+            ts = ts or str(body.get("timestamp") or body.get("ts") or "")
+            sig = sig or body.get("hashKey") or body.get("signature")
+
+        if not client_id or not ts or not sig:
+            return jsonify({"error": "missing HMAC auth (client/timestamp/signature)"}), 401
+
+        try:
+            ts_int = int(str(ts))
+        except Exception:
+            return jsonify({"error": "invalid timestamp"}), 401
+
+        now = int(time.time())
+        if abs(now - ts_int) > HMAC_TTL_SECONDS:
+            return jsonify({"error": "timestamp expired"}), 401
+
+        secret = _get_client_secret(str(client_id))
+        if not secret:
+            return jsonify({"error": "unknown client"}), 401
+
+        payload_str = _build_payload_to_sign(request)
+        expected = _compute_signature(secret, request.method, request.path, str(ts_int), payload_str)
+        if not hmac.compare_digest(expected, str(sig)):
+            return jsonify({"error": "invalid signature"}), 401
+
+        # نمرر هوية العميل عبر g
+        try:
+            g.client_id = str(client_id)
+        except Exception:
+            pass
+        return func(*args, **kwargs)
+    return wrapper
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
 # ================= بحث الاسم التجاري =================
 @app.get("/search")
+@require_hmac
 def search_get():
     """
     GET /search?q=اسم_الدواء&limit=50&minscore=5&topk=400
@@ -72,6 +194,7 @@ def search_get():
         return jsonify({"error": str(e)}), 500
 
 @app.post("/search")
+@require_hmac
 def search_post():
     """
     POST /search
@@ -101,6 +224,7 @@ def search_post():
 
 # ==================== Endpoints المثائل ====================
 @app.get("/equivalents")
+@require_hmac
 def equivalents_get():
     """
     GET /equivalents?active=باراسيتامول&mg=500&form=أقراص&tol=0&allow_per_ml=true&strict_form=true&limit=50&topk=800&minbase=0&debug=1
@@ -202,6 +326,7 @@ def equivalents_get():
         return jsonify({"error": str(e)}), 500
 
 @app.post("/equivalents")
+@require_hmac
 def equivalents_post():
     """
     POST /equivalents
