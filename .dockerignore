@@ -1,0 +1,14 @@
+env/
+.venv/
+venv/
+__pycache__/
+*.pyc
+**/__pycache__/
+**/*.pyc
+.git
+hf_cache/
+logs/
+chroma_db/
+merged_data.json
+*.sqlite3
+*.pkl
