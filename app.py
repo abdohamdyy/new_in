@@ -46,6 +46,31 @@ def parse_bool(val, default: bool) -> bool:
     s = str(val).strip().lower()
     return s in ("1", "true", "t", "yes", "y", "on", "اه", "ايوه")
 
+def paginate_list(items, page: int, per_page: int):
+    try:
+        per_page = max(1, int(per_page))
+    except Exception:
+        per_page = 10
+    try:
+        page = max(1, int(page))
+    except Exception:
+        page = 1
+
+    total = len(items)
+    last_page = max(1, (total + per_page - 1) // per_page)
+    if page > last_page:
+        page = last_page
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    data = items[start:end]
+    return data, {
+        "current_page": page,
+        "last_page": last_page,
+        "per_page": per_page,
+        "total": total
+    }
+
 # ================= أمان HMAC حسب كل عميل =================
 # يمكن تعريف الأسرار عبر متغير بيئة JSON: HMAC_CLIENT_SECRETS='{"duaya_index":"secret1","salamtk":"secret2"}'
 # أو عبر متغيرات بيئة منفصلة: HMAC_SECRET_DUAYA_INDEX=... , HMAC_SECRET_SALAMTK=...
@@ -171,8 +196,9 @@ def health():
 @require_hmac
 def search_get():
     """
-    GET /search?q=اسم_الدواء&limit=50&minscore=5&topk=400
-    يرجّع قائمة JSON بكل المعلومات (meta كاملة)
+    GET /search?q=اسم_الدواء&limit=50&minscore=5&topk=400&page=1&per_page=10
+    - لو page/per_page موجودين: يرجّع {"data": [...], "pagination": {...}}
+    - لو غير موجودين: يرجّع نفس ال list كالقديم
     """
     q = request.args.get("q")
     if not q or not q.strip():
@@ -182,8 +208,23 @@ def search_get():
     minscore = request.args.get("minscore", type=float) or SEARCH_MIN_SCORE10
     topk = request.args.get("topk", type=int) or SEARCH_TOP_K
 
+    page = request.args.get("page", type=int)
+    per_page = request.args.get("per_page", type=int)
+    paginate = (page is not None) or (per_page is not None)
+    if page is None:
+        page = 1
+    if per_page is None:
+        per_page = 10
+
     try:
         results = searcher.search_one(q.strip(), top_k=topk, min_score10=minscore, limit=limit)
+        if paginate:
+            data, meta = paginate_list(results, page, per_page)
+            return app.response_class(
+                response=json.dumps({"data": data, "pagination": meta}, ensure_ascii=False),
+                status=200,
+                mimetype="application/json; charset=utf-8",
+            )
         return app.response_class(
             response=json.dumps(results, ensure_ascii=False),
             status=200,
@@ -198,7 +239,9 @@ def search_get():
 def search_post():
     """
     POST /search
-    Body: {"query":"اسم الدواء","limit":50,"minscore":5,"topk":400}
+    Body: {"query":"اسم الدواء","limit":50,"minscore":5,"topk":400,"page":1,"per_page":10}
+    - لو page/per_page موجودين: يرجّع {"data": [...], "pagination": {...}}
+    - لو غير موجودين: يرجّع نفس ال list كالقديم
     """
     if not request.is_json:
         return jsonify({"error": "expected application/json body"}), 400
@@ -211,8 +254,31 @@ def search_post():
     minscore = float(payload.get("minscore") or SEARCH_MIN_SCORE10)
     topk = int(payload.get("topk") or SEARCH_TOP_K)
 
+    page = payload.get("page")
+    per_page = payload.get("per_page")
+    try:
+        page = int(page) if page is not None else None
+    except Exception:
+        page = None
+    try:
+        per_page = int(per_page) if per_page is not None else None
+    except Exception:
+        per_page = None
+    paginate = (page is not None) or (per_page is not None)
+    if page is None:
+        page = 1
+    if per_page is None:
+        per_page = 10
+
     try:
         results = searcher.search_one(q, top_k=topk, min_score10=minscore, limit=limit)
+        if paginate:
+            data, meta = paginate_list(results, page, per_page)
+            return app.response_class(
+                response=json.dumps({"data": data, "pagination": meta}, ensure_ascii=False),
+                status=200,
+                mimetype="application/json; charset=utf-8",
+            )
         return app.response_class(
             response=json.dumps(results, ensure_ascii=False),
             status=200,
@@ -227,11 +293,12 @@ def search_post():
 @require_hmac
 def equivalents_get():
     """
-    GET /equivalents?active=باراسيتامول&mg=500&form=أقراص&tol=0&allow_per_ml=true&strict_form=true&limit=50&topk=800&minbase=0&debug=1
+    GET /equivalents?active=باراسيتامول&mg=500&form=أقراص&tol=0&allow_per_ml=true&strict_form=true&limit=50&topk=800&minbase=0&debug=1&page=1&per_page=10
     - active: إجباري (المادة الفعّالة/الاسم العلمي)
     - mg: إجباري (تركيز بالمليجرام)
     - form: اختياري (أقراص/كبسول/شراب/أمبول/...)
     - debug: اختياري (لو true يطلع لوجز تفصيلية في docker logs)
+    - دعم Pagination اختياري لكل من equivalents و alternatives
     """
     # دعم إدخال متعدد المواد عبر actives (JSON list). لو غير متاح نرجع للنمط القديم active+mg
     actives_raw = request.args.get("actives", type=str)
@@ -262,6 +329,14 @@ def equivalents_get():
     topk = request.args.get("topk", type=int) or EQ_TOP_K
     minbase = request.args.get("minbase", type=float) or EQ_MIN_BASE10
     debug_flag = parse_bool(request.args.get("debug"), True)
+
+    page = request.args.get("page", type=int)
+    per_page = request.args.get("per_page", type=int)
+    paginate = (page is not None) or (per_page is not None)
+    if page is None:
+        page = 1
+    if per_page is None:
+        per_page = 10
 
     try:
         if debug_flag:
@@ -313,6 +388,20 @@ def equivalents_get():
                 debug=debug_flag,
             )
         logger.info(f"/equivalents -> equivalents={len(eq_results)} alternatives={len(alt_results)}")
+        if paginate:
+            eq_data, eq_meta = paginate_list(eq_results, page, per_page)
+            alt_data, alt_meta = paginate_list(alt_results, page, per_page)
+            return app.response_class(
+                response=json.dumps({
+                    "equivalents": eq_data,
+                    "equivalents_pagination": eq_meta,
+                    "alternatives": alt_data,
+                    "alternatives_pagination": alt_meta,
+                }, ensure_ascii=False),
+                status=200,
+                mimetype="application/json; charset=utf-8",
+            )
+
         return app.response_class(
             response=json.dumps({
                 "equivalents": eq_results,
@@ -341,7 +430,9 @@ def equivalents_post():
         "limit": 50,
         "topk": 800,
         "minbase": 0.0,
-        "debug": true
+        "debug": true,
+        "page": 1,
+        "per_page": 10
       }
     """
     if not request.is_json:
@@ -368,6 +459,22 @@ def equivalents_post():
     topk = int(payload.get("topk") or EQ_TOP_K)
     minbase = float(payload.get("minbase") or EQ_MIN_BASE10)
     debug_flag = parse_bool(payload.get("debug"), True)
+
+    page = payload.get("page")
+    per_page = payload.get("per_page")
+    try:
+        page = int(page) if page is not None else None
+    except Exception:
+        page = None
+    try:
+        per_page = int(per_page) if per_page is not None else None
+    except Exception:
+        per_page = None
+    paginate = (page is not None) or (per_page is not None)
+    if page is None:
+        page = 1
+    if per_page is None:
+        per_page = 10
 
     try:
         if debug_flag:
@@ -419,6 +526,20 @@ def equivalents_post():
                 debug=debug_flag,
             )
         logger.info(f"/equivalents -> equivalents={len(eq_results)} alternatives={len(alt_results)}")
+        if paginate:
+            eq_data, eq_meta = paginate_list(eq_results, page, per_page)
+            alt_data, alt_meta = paginate_list(alt_results, page, per_page)
+            return app.response_class(
+                response=json.dumps({
+                    "equivalents": eq_data,
+                    "equivalents_pagination": eq_meta,
+                    "alternatives": alt_data,
+                    "alternatives_pagination": alt_meta,
+                }, ensure_ascii=False),
+                status=200,
+                mimetype="application/json; charset=utf-8",
+            )
+
         return app.response_class(
             response=json.dumps({
                 "equivalents": eq_results,
